@@ -60,6 +60,7 @@
           name = "mpdc-dev";
           packages = [
             pythonEnv
+            mpdcPkg
             pkgs.uv
             pkgs.git
             pkgs.jq
@@ -72,7 +73,7 @@
             echo " MPDC DevShell (NixOS -> Ubuntu Portable Stack)"
             echo " Model Family : Latest Qwen3 (Qwen3-8B / Qwen3-14B / 30B-A3B)"
             echo " Primary Client: OpenCode (see ./opencode.json)"
-            echo " Commands     : python -m mpdc.cli --help"
+            echo " Commands     : mpdc --help"
             echo "=========================================================="
           '';
         };
