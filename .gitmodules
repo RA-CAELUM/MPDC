@@ -1,0 +1,3 @@
+[submodule "modules/MPDC-SICA"]
+	path = modules/MPDC-SICA
+	url = https://github.com/RA-CAELUM/MPDC-SICA.git
