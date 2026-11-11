@@ -1,0 +1,44 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "mpdc": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "MPDC Local Datacenter (Qwen3 Self-Improving)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "mpdc-local"
+      },
+      "models": {
+        "qwen3-mpdc": {
+          "name": "Qwen3 (MPDC Multi-Agent + Episodic Skills + Active LoRA)",
+          "attachment": false,
+          "reasoning": true,
+          "tool_call": true,
+          "limit": {
+            "context": 32768,
+            "output": 8192
+          }
+        },
+        "qwen3-mpdc-fast": {
+          "name": "Qwen3 Fast Coder (/no_think + Speculative)",
+          "attachment": false,
+          "reasoning": false,
+          "tool_call": true,
+          "limit": {
+            "context": 32768,
+            "output": 4096
+          }
+        }
+      }
+    }
+  },
+  "model": "mpdc/qwen3-mpdc",
+  "small_model": "mpdc/qwen3-mpdc-fast",
+  "mcp": {
+    "mpdc-agents": {
+      "type": "local",
+      "command": ["python", "-m", "mpdc.cli", "mcp"],
+      "enabled": true
+    }
+  }
+}

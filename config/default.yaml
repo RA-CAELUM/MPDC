@@ -1,0 +1,54 @@
+# MPDC Default Configuration (Software Architecture First - NixOS / Ubuntu)
+server:
+  host: "0.0.0.0"
+  port: 8000
+  data_dir: "./.mpdc_data"
+
+inference:
+  # Pluggable engine: "vllm" (primary, native Safetensors + dynamic PEFT Multi-LoRA),
+  # "sglang", or "llama_cpp"
+  engine: "vllm"
+  backend_url: "http://127.0.0.1:8001/v1"
+  api_key: "mpdc-local"
+
+  # Primary model family: Latest Qwen3
+  base_model: "Qwen/Qwen3-8B"
+  embedding_model: "Qwen/Qwen3-Embedding-0.6B"
+
+  # Qwen3 Hybrid Thinking Mode Routing
+  # Planner & Critic use <think> mode; fast Coder patches can toggle /no_think
+  enable_thinking_for_planner: true
+  enable_thinking_for_coder: false
+  enable_thinking_for_distiller: true
+
+  # Dynamic Multi-LoRA state
+  active_adapter_name: null
+  active_adapter_path: null
+
+agents:
+  max_verification_retries: 3
+  top_k_skills: 4
+  min_skill_similarity: 0.25
+
+harvester:
+  # 80% of solved failures go to QLoRA training; 20% go to the Golden Replay Holdout Suite
+  train_split_ratio: 0.80
+  min_patch_lines: 2
+  # Patch Survival Rate threshold to classify a git commit as a positive "chosen" sample
+  chosen_survival_threshold: 0.75
+
+trainer:
+  # Runs strictly on the local host node overnight or on `mpdc train --now`
+  lora_rank: 16
+  lora_alpha: 32
+  learning_rate: 2.0e-4
+  num_epochs: 2
+  max_seq_length: 4096
+  min_samples_to_train: 10
+  pause_inference_during_training: true
+
+evaluation:
+  # Promotion gate thresholds for Candidate Adapter vN+1 vs Current vN
+  min_replay_pass_rate_delta: 0.0     # Candidate must >= Current on Golden Replay Pass@1
+  max_sanity_regression: 0.02         # Candidate cannot drop >2% on core Python/C++/Nix/ROS2 sanity checks
+  require_perplexity_improvement: true

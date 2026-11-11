@@ -1,0 +1,45 @@
+# Ubuntu Portability Layer (Phase 5 ready)
+# Launches vLLM with latest Qwen3 + dynamic Multi-LoRA alongside the MPDC Gateway.
+services:
+  vllm-qwen3:
+    image: vllm/vllm-openai:latest
+    container_name: mpdc-vllm
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      - VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
+      - HF_HOME=/data/hf_cache
+    volumes:
+      - ./data:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      --model Qwen/Qwen3-8B-AWQ
+      --enable-lora
+      --max-lora-rank 32
+      --enable-auto-tool-choice
+      --tool-call-parser hermes
+      --reasoning-parser qwen3
+      --enable-prefix-caching
+
+  mpdc-gateway:
+    build:
+      context: .
+    container_name: mpdc-gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - MPDC_DATA_DIR=/data/mpdc
+      - MPDC_BACKEND_URL=http://vllm-qwen3:8000/v1
+    volumes:
+      - ./data:/data
+      - ./config:/app/config:ro
+    depends_on:
+      - vllm-qwen3

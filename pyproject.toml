@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mpdc"
+version = "0.1.0"
+description = "Mini-PC Local LLM Datacenter: OpenCode-centric Multi-Agent & Self-Improving Qwen3 Stack"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "sgk" }]
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.9.0",
+    "pyyaml>=6.0.2",
+    "typer>=0.12.5",
+    "rich>=13.8.0",
+    "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+]
+train = [
+    "torch>=2.4.0",
+    "transformers>=4.51.0",
+    "peft>=0.13.0",
+    "trl>=0.11.0",
+    "datasets>=3.0.0",
+]
+
+[project.scripts]
+mpdc = "mpdc.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mpdc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
