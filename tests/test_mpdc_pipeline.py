@@ -248,3 +248,39 @@ def test_multinode_sse_streaming_pause_and_hud_overview(tmp_path: Path) -> None:
     assert len(overview["nodes"]) == 1
     assert overview["nodes"][0]["node_id"] == "rtx5070-laptop"
     assert overview["nodes"][0]["completion_tokens"] > 0
+
+
+def test_sica_local_qwen3_provider_and_think_block_stripping() -> None:
+    import sys
+
+    sica_root = str(Path(__file__).resolve().parents[1] / "modules" / "MPDC-SICA" / "base_agent")
+    if sica_root not in sys.path:
+        sys.path.insert(0, sica_root)
+
+    from src.config import Settings
+    from src.llm.providers.local import LocalOpenAIProvider, split_qwen_think_blocks
+    from src.types.common import ArgFormat
+    from src.types.llm_types import FCI, Model, Provider
+
+    cfg = Settings()
+    assert cfg.MODEL == Model.QWEN3
+    assert cfg.REASONING_MODEL == Model.QWEN3_REASONER
+    assert cfg.OVERSIGHT_MODEL == Model.QWEN3
+    assert Model.QWEN3.provider == Provider.LOCAL
+    assert Model.QWEN3.fci == FCI.UNCONSTRAINED
+    assert Model.QWEN3.arg_format == ArgFormat.XML
+
+    raw_qwen_output = (
+        "<think>\nLet's inspect the directory first before editing.\n</think>\n"
+        "I will list the directory contents.\n"
+        "<TOOL_CALL>\n<TOOL_NAME>view_directory</TOOL_NAME>\n"
+        "<TOOL_ARGS>\n<path>/home/agent/workdir</path>\n</TOOL_ARGS>"
+    )
+    cot, clean_text = split_qwen_think_blocks(raw_qwen_output)
+    assert "inspect the directory first" in cot
+    assert "<think>" not in clean_text
+    assert clean_text.endswith("</TOOL_ARGS>")
+
+    provider = LocalOpenAIProvider()
+    assert str(provider.client.base_url).rstrip("/").endswith("/v1")
+
