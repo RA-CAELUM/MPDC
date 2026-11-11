@@ -1,5 +1,5 @@
 {
-  description = "MPDC: Mini-PC Local LLM Datacenter (Qwen3 + vLLM + Multi-Agent + Self-Improving Pipeline)";
+  description = "MPDC: Mini-PC Local LLM Datacenter (Qwen3 + vLLM + Multi-Node Token Switchboard + Self-Improving Pipeline)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -33,7 +33,7 @@
 
         mpdcPkg = python.pkgs.buildPythonApplication {
           pname = "mpdc";
-          version = "0.1.0";
+          version = "0.2.0";
           pyproject = true;
           src = ./.;
           build-system = [ python.pkgs.hatchling ];
@@ -49,6 +49,17 @@
           ];
           doCheck = false;
         };
+
+        guiRuntimeLibs = with pkgs; [
+          wayland
+          libxkbcommon
+          libGL
+          vulkan-loader
+          xorg.libX11
+          xorg.libXcursor
+          xorg.libXi
+          xorg.libXrandr
+        ];
       in
       {
         packages = {
@@ -61,20 +72,25 @@
           packages = [
             pythonEnv
             mpdcPkg
+            pkgs.cargo
+            pkgs.rustc
+            pkgs.pkg-config
             pkgs.uv
             pkgs.git
             pkgs.jq
             pkgs.sqlite
-          ];
+          ] ++ guiRuntimeLibs;
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath guiRuntimeLibs;
           shellHook = ''
             export PYTHONPATH="$PWD/src:$PYTHONPATH"
             export MPDC_CONFIG="$PWD/config/default.yaml"
-            echo "=========================================================="
-            echo " MPDC DevShell (NixOS -> Ubuntu Portable Stack)"
-            echo " Model Family : Latest Qwen3 (Qwen3-8B / Qwen3-14B / 30B-A3B)"
-            echo " Primary Client: OpenCode (see ./opencode.json)"
-            echo " Commands     : mpdc --help"
-            echo "=========================================================="
+            echo "=================================================================="
+            echo " MPDC Mission Control DevShell (NixOS -> Ubuntu Portable Stack)"
+            echo " Model Family  : Latest Qwen3 (Qwen3-8B / Qwen3-14B / 30B-A3B)"
+            echo " CLI btop TUI  : mpdc top"
+            echo " Native Rust UI: mpdc gui"
+            echo " Gateway Server: mpdc serve --seed-demo"
+            echo "=================================================================="
           '';
         };
       })) // {

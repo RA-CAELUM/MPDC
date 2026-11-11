@@ -1,4 +1,4 @@
-"""Tier 1 Episodic Skill Bank, Trajectory Store, and Telemetry Database."""
+"""Tier 1 Episodic Skill Bank, Client Node Registry, Trajectory Store, and Telemetry Database."""
 
 from __future__ import annotations
 
@@ -56,6 +56,7 @@ class SkillCard:
     success_count: int = 0
     failure_count: int = 0
     similarity: float = 0.0
+    active: bool = True
 
     @property
     def utility_score(self) -> float:
@@ -73,11 +74,26 @@ class TaskTelemetry:
     skills_used: list[int]
     adapter_version: str
     tokens_used: int = 0
+    client_node: str = "local-workstation"
     created_at: float = field(default_factory=time.time)
 
 
+@dataclass
+class ClientNode:
+    node_id: str
+    hostname: str
+    ip_address: str
+    status: str  # "online", "streaming", "paused"
+    requests_count: int
+    prompt_tokens: int
+    completion_tokens: int
+    last_tok_per_sec: float
+    active_model: str
+    last_seen: float
+
+
 class MPDCStore:
-    """SQLite + Vector store backing Tier 1 Episodic Skills, Tier 2 Trajectories, and Telemetry."""
+    """SQLite + Vector store backing Episodic Skills, Client Output Nodes, Trajectories, and Telemetry."""
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
@@ -119,6 +135,7 @@ class MPDCStore:
                     skills_used_json TEXT NOT NULL,
                     adapter_version TEXT NOT NULL,
                     tokens_used INTEGER DEFAULT 0,
+                    client_node TEXT DEFAULT 'local-workstation',
                     created_at REAL NOT NULL
                 );
 
@@ -144,8 +161,127 @@ class MPDCStore:
                     promoted INTEGER NOT NULL,
                     created_at REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS client_nodes (
+                    node_id TEXT PRIMARY KEY,
+                    hostname TEXT NOT NULL,
+                    ip_address TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'online',
+                    requests_count INTEGER DEFAULT 0,
+                    prompt_tokens INTEGER DEFAULT 0,
+                    completion_tokens INTEGER DEFAULT 0,
+                    last_tok_per_sec REAL DEFAULT 0.0,
+                    active_model TEXT DEFAULT 'qwen3-mpdc',
+                    last_seen REAL NOT NULL
+                );
                 """
             )
+
+    def upsert_client_node(
+        self,
+        node_id: str,
+        hostname: Optional[str] = None,
+        ip_address: str = "127.0.0.1",
+        prompt_tokens_delta: int = 0,
+        completion_tokens_delta: int = 0,
+        tok_per_sec: Optional[float] = None,
+        active_model: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM client_nodes WHERE node_id = ?", (node_id,)
+            ).fetchone()
+            if row is None:
+                final_status = status or "online"
+                conn.execute(
+                    """
+                    INSERT INTO client_nodes (
+                        node_id, hostname, ip_address, status, requests_count,
+                        prompt_tokens, completion_tokens, last_tok_per_sec, active_model, last_seen
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        node_id,
+                        hostname or node_id,
+                        ip_address,
+                        final_status,
+                        1 if (prompt_tokens_delta or completion_tokens_delta) else 0,
+                        prompt_tokens_delta,
+                        completion_tokens_delta,
+                        tok_per_sec or 0.0,
+                        active_model or "qwen3-mpdc",
+                        now,
+                    ),
+                )
+            else:
+                # Preserve 'paused' unless explicitly overridden
+                current_status = row["status"]
+                new_status = status if status is not None else current_status
+                req_inc = 1 if (prompt_tokens_delta or completion_tokens_delta) else 0
+                conn.execute(
+                    """
+                    UPDATE client_nodes
+                    SET hostname = ?,
+                        ip_address = ?,
+                        status = ?,
+                        requests_count = requests_count + ?,
+                        prompt_tokens = prompt_tokens + ?,
+                        completion_tokens = completion_tokens + ?,
+                        last_tok_per_sec = ?,
+                        active_model = ?,
+                        last_seen = ?
+                    WHERE node_id = ?
+                    """,
+                    (
+                        hostname or row["hostname"],
+                        ip_address or row["ip_address"],
+                        new_status,
+                        req_inc,
+                        prompt_tokens_delta,
+                        completion_tokens_delta,
+                        tok_per_sec if tok_per_sec is not None else row["last_tok_per_sec"],
+                        active_model or row["active_model"],
+                        now,
+                        node_id,
+                    ),
+                )
+            updated = conn.execute(
+                "SELECT * FROM client_nodes WHERE node_id = ?", (node_id,)
+            ).fetchone()
+            return dict(updated)
+
+    def get_client_node(self, node_id: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM client_nodes WHERE node_id = ?", (node_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_client_nodes(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM client_nodes ORDER BY last_seen DESC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def toggle_client_node_pause(self, node_id: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM client_nodes WHERE node_id = ?", (node_id,)
+            ).fetchone()
+            if not row:
+                return None
+            new_status = "online" if row["status"] == "paused" else "paused"
+            conn.execute(
+                "UPDATE client_nodes SET status = ? WHERE node_id = ?",
+                (new_status, node_id),
+            )
+            updated = conn.execute(
+                "SELECT * FROM client_nodes WHERE node_id = ?", (node_id,)
+            ).fetchone()
+            return dict(updated)
 
     def add_skill(
         self,
@@ -180,6 +316,50 @@ class MPDCStore:
             )
             return int(cur.lastrowid)
 
+    def list_skills(self, include_inactive: bool = True) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            query = (
+                "SELECT * FROM episodic_skills ORDER BY id DESC"
+                if include_inactive
+                else "SELECT * FROM episodic_skills WHERE active = 1 ORDER BY id DESC"
+            )
+            rows = conn.execute(query).fetchall()
+        result = []
+        for r in rows:
+            s, f = r["success_count"], r["failure_count"]
+            utility = round((s + 1.0) / (s + f + 2.0), 3)
+            result.append(
+                {
+                    "id": r["id"],
+                    "title": r["title"],
+                    "domain": r["domain"],
+                    "trigger_signature": r["trigger_signature"],
+                    "anti_pattern": r["anti_pattern"],
+                    "verified_pattern": r["verified_pattern"],
+                    "times_retrieved": r["times_retrieved"],
+                    "success_count": s,
+                    "failure_count": f,
+                    "utility_score": utility,
+                    "active": bool(r["active"]),
+                }
+            )
+        return result
+
+    def toggle_skill(self, skill_id: int) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM episodic_skills WHERE id = ?", (skill_id,)
+            ).fetchone()
+            if not row:
+                return None
+            new_active = 0 if row["active"] else 1
+            conn.execute(
+                "UPDATE episodic_skills SET active = ? WHERE id = ?",
+                (new_active, skill_id),
+            )
+        skills = [s for s in self.list_skills(include_inactive=True) if s["id"] == skill_id]
+        return skills[0] if skills else None
+
     def retrieve_skills(
         self, query: str, top_k: int = 4, min_similarity: float = 0.20
     ) -> list[SkillCard]:
@@ -206,6 +386,7 @@ class MPDCStore:
                     success_count=r["success_count"],
                     failure_count=r["failure_count"],
                     similarity=sim,
+                    active=bool(r["active"]),
                 )
                 scored.append(card)
 
@@ -227,8 +408,9 @@ class MPDCStore:
                 """
                 INSERT OR REPLACE INTO task_telemetry (
                     task_id, prompt, domain, passed_first_try, iterations_to_green,
-                    patch_survival_rate, skills_used_json, adapter_version, tokens_used, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    patch_survival_rate, skills_used_json, adapter_version, tokens_used,
+                    client_node, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     telemetry.task_id,
@@ -240,6 +422,7 @@ class MPDCStore:
                     json.dumps(telemetry.skills_used),
                     telemetry.adapter_version,
                     telemetry.tokens_used,
+                    telemetry.client_node,
                     telemetry.created_at,
                 ),
             )
@@ -332,6 +515,13 @@ class MPDCStore:
                     time.time(),
                 ),
             )
+
+    def list_adapters(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM adapter_registry ORDER BY created_at DESC"
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def get_latest_promoted_adapter(self) -> Optional[dict[str, Any]]:
         with self._connect() as conn:

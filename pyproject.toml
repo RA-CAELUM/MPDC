@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mpdc"
-version = "0.1.0"
+version = "0.2.0"
 description = "Mini-PC Local LLM Datacenter: OpenCode-centric Multi-Agent & Self-Improving Qwen3 Stack"
 readme = "README.md"
 requires-python = ">=3.11"

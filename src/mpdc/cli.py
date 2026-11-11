@@ -1,9 +1,12 @@
-"""Unified CLI for MPDC (`mpdc serve`, `mpdc stats`, `mpdc eval`, `mpdc train`, `mpdc harvest`, `mpdc mcp`)."""
+"""Unified CLI for MPDC (`mpdc serve`, `mpdc top`, `mpdc gui`, `mpdc stats`, `mpdc eval`, `mpdc train`, `mpdc harvest`, `mpdc mcp`)."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -14,15 +17,16 @@ from rich.table import Table
 
 from mpdc.config import MPDCConfig
 from mpdc.evaluation.quantifier import SelfImprovementQuantifier
-from mpdc.gateway.server import create_gateway_app
+from mpdc.gateway.server import build_client_opencode_config, create_gateway_app
 from mpdc.harvester.collector import TrajectoryHarvester
 from mpdc.mcp_server.server import MPDCMCPServer
 from mpdc.memory.store import MPDCStore
 from mpdc.trainer.qlora import OnNodeQLoRATrainer
+from mpdc.tui.app import run_btop_tui, seed_demo_datacenter_activity
 
 app = typer.Typer(
     name="mpdc",
-    help="MPDC: Mini-PC Local LLM Datacenter (Qwen3 + OpenCode + 3-Tier Self-Improving Pipeline)",
+    help="MPDC: Mini-PC Local LLM Datacenter (Qwen3 + Multi-Node Token Switchboard + 3-Tier Self-Improving Pipeline)",
     add_completion=False,
 )
 console = Console()
@@ -36,25 +40,74 @@ def _load_context(config_path: Optional[str] = None) -> tuple[MPDCConfig, MPDCSt
 
 @app.command("serve")
 def serve(
-    host: Optional[str] = typer.Option(None, help="Bind host override"),
-    port: Optional[int] = typer.Option(None, help="Bind port override"),
+    host: Optional[str] = typer.Option(None, help="Bind host override (default 0.0.0.0)"),
+    port: Optional[int] = typer.Option(None, help="Bind port override (default 8000)"),
+    seed_demo: bool = typer.Option(False, "--seed-demo", help="Seed sample multi-computer nodes and skills on startup"),
     config: Optional[str] = typer.Option(None, help="Path to YAML config"),
 ) -> None:
-    """Start the OpenCode-compatible MPDC OpenAI Gateway (`/v1/chat/completions`)."""
-    cfg = MPDCConfig.load(config)
+    """Start the MPDC OpenAI Gateway (`/v1/chat/completions` with SSE token streaming + Remote MCP `/mcp`)."""
+    cfg, store = _load_context(config)
+    if seed_demo:
+        seed_demo_datacenter_activity(cfg, store)
     bind_host = host or cfg.server.host
     bind_port = port or cfg.server.port
     gateway_app = create_gateway_app(cfg)
     console.print(
         Panel(
-            f"[bold green]MPDC Gateway Online[/bold green]\n"
-            f"• Endpoint: [cyan]http://{bind_host}:{bind_port}/v1[/cyan]\n"
-            f"• Engine: [yellow]{cfg.inference.engine}[/yellow] ({cfg.inference.backend_url})\n"
-            f"• Backbone: [magenta]{cfg.inference.base_model}[/magenta]",
+            f"[bold green]MPDC Datacenter Gateway Online[/bold green]\n"
+            f"• OpenAI SSE Stream : [cyan]http://{bind_host}:{bind_port}/v1/chat/completions[/cyan]\n"
+            f"• Remote HTTP MCP   : [cyan]http://{bind_host}:{bind_port}/mcp[/cyan]\n"
+            f"• HUD Overview API  : [cyan]http://{bind_host}:{bind_port}/v1/mpdc/overview[/cyan]\n"
+            f"• Engine & Backbone : [yellow]{cfg.inference.engine}[/yellow] ({cfg.inference.base_model})",
             title="MPDC Local LLM Datacenter",
         )
     )
     uvicorn.run(gateway_app, host=bind_host, port=bind_port)
+
+
+@app.command("top")
+def top(
+    seed_demo: bool = typer.Option(True, "--seed-demo/--no-seed-demo", help="Populate demo multi-computer traffic if empty"),
+    once: bool = typer.Option(False, "--once", help="Render a single full-screen snapshot and exit"),
+    config: Optional[str] = typer.Option(None, help="Path to YAML config"),
+) -> None:
+    """Launch the native Rust ratatui btop++ 4-quadrant Terminal UI (`mpdc-tui`)."""
+    cfg, store = _load_context(config)
+    if seed_demo and not store.list_client_nodes():
+        seed_demo_datacenter_activity(cfg, store)
+    gui_dir = Path(__file__).resolve().parents[2] / "gui" / "mpdc-gui"
+    args = ["cargo", "run", "--release", "--bin", "mpdc-tui", "--"]
+    if once:
+        args.append("--once")
+    subprocess.run(args, cwd=str(gui_dir), check=True)
+
+
+@app.command("gui")
+def gui(
+    gateway_url: str = typer.Option("http://127.0.0.1:8000", help="MPDC Gateway URL to poll"),
+) -> None:
+    """Build and launch the native GPU-rendered Rust egui/eframe Mission Control desktop HUD (`gui/mpdc-gui`)."""
+    gui_dir = Path(__file__).resolve().parents[2] / "gui" / "mpdc-gui"
+    if not gui_dir.exists():
+        console.print(f"[red]GUI crate not found at {gui_dir}[/red]")
+        raise typer.Exit(1)
+    env = os.environ.copy()
+    env["MPDC_GATEWAY_URL"] = gateway_url
+    console.print(f"[bold cyan]Launching native Rust egui Mission Control HUD ({gui_dir})...[/bold cyan]")
+    subprocess.run(["cargo", "run", "--release"], cwd=str(gui_dir), env=env, check=True)
+
+
+@app.command("client-config")
+def client_config(
+    node_id: str = typer.Option("rtx5070-laptop", "--node", help="Identifier for the remote client computer"),
+    datacenter_host: str = typer.Option("mpdc.local", "--host", help="LAN or Tailscale hostname/IP of the MPDC Mini-PC"),
+    config: Optional[str] = typer.Option(None, help="Path to YAML config"),
+) -> None:
+    """Generate a drop-in `opencode.json` for a remote laptop/computer to stream tokens & MCP tools from MPDC."""
+    cfg, store = _load_context(config)
+    store.upsert_client_node(node_id=node_id, hostname=node_id, ip_address=datacenter_host)
+    payload = build_client_opencode_config(datacenter_host, cfg.server.port, node_id)
+    typer.echo(json.dumps(payload, indent=2))
 
 
 @app.command("mcp")

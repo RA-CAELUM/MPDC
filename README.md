@@ -1,5 +1,8 @@
 # MPDC: Mini-PC Local LLM Datacenter
 
+I MADE THIS TOOL FOR MYSELF BECAUSE I WANTED TO SAVE MONEY ON CLAUDECODE TOKENS. THE FUTURE OF PROGRAMMING DOES NOT RELY ON BIG TECH DATA CENTERS. 
+INDEPENDENCE FOR MEAT PROXIES , VIVA LA MEAT PROXY 
+
 OpenCode-centric local **Qwen3** multi-agent & 3-tier self-improving LLM stack designed for NixOS (and portable to Ubuntu via Docker Compose / Nix flakes).
 
 ## Quickstart

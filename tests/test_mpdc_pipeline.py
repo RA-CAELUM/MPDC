@@ -186,3 +186,65 @@ def test_gateway_skill_injection_and_mcp_server(tmp_path: Path) -> None:
     body = resp.json()
     assert body["mpdc_metadata"]["qwen3_thinking"] is True
     assert len(body["mpdc_metadata"]["skills_injected"]) == 1
+
+
+def test_multinode_sse_streaming_pause_and_hud_overview(tmp_path: Path) -> None:
+    cfg = _make_test_config(tmp_path)
+    app = create_gateway_app(cfg)
+    client = TestClient(app)
+
+    # 1. Register a remote laptop computer (`rtx5070-laptop`)
+    reg = client.post(
+        "/v1/mpdc/nodes/register",
+        json={
+            "node_id": "rtx5070-laptop",
+            "hostname": "sgk-nixos-laptop",
+            "ip_address": "192.168.1.42",
+            "datacenter_host": "mpdc.local",
+        },
+    )
+    assert reg.status_code == 200
+    reg_data = reg.json()
+    assert reg_data["opencode_config"]["provider"]["mpdc"]["options"]["headers"]["X-MPDC-Client-Node"] == "rtx5070-laptop"
+    assert reg_data["opencode_config"]["mcp"]["mpdc-agents"]["url"] == "http://mpdc.local:8000/mcp"
+
+    # 2. Stream tokens via SSE (`stream: true`) to `rtx5070-laptop`
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"X-MPDC-Client-Node": "rtx5070-laptop"},
+        json={
+            "model": "qwen3-mpdc",
+            "stream": True,
+            "messages": [{"role": "user", "content": "Write a ROS2 publisher"}],
+        },
+    ) as stream_resp:
+        assert stream_resp.status_code == 200
+        raw_sse = "".join(stream_resp.iter_text())
+        assert "data: [DONE]" in raw_sse
+        assert "rtx5070-laptop" in raw_sse
+
+    # 3. Pause token stream to `rtx5070-laptop` and verify 403 block
+    toggle = client.post("/v1/mpdc/nodes/rtx5070-laptop/toggle")
+    assert toggle.status_code == 200
+    assert toggle.json()["status"] == "paused"
+
+    blocked = client.post(
+        "/v1/chat/completions",
+        headers={"X-MPDC-Client-Node": "rtx5070-laptop"},
+        json={
+            "model": "qwen3-mpdc",
+            "messages": [{"role": "user", "content": "Should be blocked while paused"}],
+        },
+    )
+    assert blocked.status_code == 403
+
+    # 4. Resume node and check `/v1/mpdc/overview` HUD payload
+    resumed = client.post("/v1/mpdc/nodes/rtx5070-laptop/toggle")
+    assert resumed.json()["status"] == "online"
+
+    overview = client.get("/v1/mpdc/overview").json()
+    assert "gpu" in overview
+    assert len(overview["nodes"]) == 1
+    assert overview["nodes"][0]["node_id"] == "rtx5070-laptop"
+    assert overview["nodes"][0]["completion_tokens"] > 0
