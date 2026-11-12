@@ -124,7 +124,7 @@ impl BtopTuiApp {
         l3.extend(btop_meter_spans(lift_norm, bar_w, GRAD_UL));
         l3.push(Span::styled(
             format!(" {:+5.1}% Pass@1", sc.skill_attribution_lift_pass_at_1 * 100.0),
-            Style::default().fg(Color::Rgb(255, 118, 238)),
+            Style::default().fg(Color::Rgb(244, 114, 182)),
         ));
 
         let l4 = Line::from(vec![
@@ -144,12 +144,12 @@ impl BtopTuiApp {
             Span::styled(" SPLIT  ", Style::default().fg(BTOP_MAIN_FG)),
             Span::styled(
                 format!("{} SFT/DPO train (80%)", sc.train_trajectories),
-                Style::default().fg(Color::Rgb(124, 159, 254)),
+                Style::default().fg(Color::Rgb(167, 139, 250)),
             ),
             Span::styled(" | ", Style::default().fg(BTOP_GRAPH_TEXT)),
             Span::styled(
                 format!("{} Golden Replay (20%)", sc.golden_replay_holdout),
-                Style::default().fg(Color::Rgb(255, 118, 238)),
+                Style::default().fg(Color::Rgb(244, 114, 182)),
             ),
         ]);
 
@@ -211,13 +211,13 @@ impl BtopTuiApp {
             Span::styled(
                 format!("{} tok out", self.overview.server.total_completion_tokens),
                 Style::default()
-                    .fg(Color::Rgb(163, 216, 255))
+                    .fg(Color::Rgb(56, 189, 248))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" | RECV ", Style::default().fg(BTOP_GRAPH_TEXT)),
             Span::styled(
                 format!("{} tok in", self.overview.server.total_prompt_tokens),
-                Style::default().fg(Color::Rgb(255, 118, 238)),
+                Style::default().fg(Color::Rgb(167, 139, 250)),
             ),
         ]);
 
@@ -347,7 +347,7 @@ impl BtopTuiApp {
                     )),
                     Cell::from(Span::styled(
                         n.active_model.clone(),
-                        Style::default().fg(Color::Rgb(163, 216, 255)),
+                        Style::default().fg(Color::Rgb(167, 139, 250)),
                     )),
                 ])
             })

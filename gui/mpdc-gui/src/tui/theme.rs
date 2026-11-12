@@ -1,34 +1,38 @@
-//! Official `btop++` `default.theme` color constants, 3-stop RGB gradients, and meter/sparkline spans.
+//! `assets/mpdc-banner.svg` (`#38bdf8 -> #a78bfa -> #f472b6`) color constants, 3-stop RGB gradients, and meter/sparkline spans for `mpdc-tui`.
 
 use ratatui::{
     style::{Color, Modifier, Style},
     text::Span,
 };
 
-pub const BTOP_MAIN_BG: Color = Color::Rgb(10, 12, 16);
-pub const BTOP_MAIN_FG: Color = Color::Rgb(204, 220, 255); // #ccdcff
-pub const BTOP_TITLE: Color = Color::Rgb(238, 235, 255); // #eeebff
-pub const BTOP_HI_FG: Color = Color::Rgb(255, 101, 64); // #ff6540
-pub const BTOP_SELECTED_BG: Color = Color::Rgb(106, 47, 47); // #6a2f2f
+// Base surfaces & typography tuned to `assets/mpdc-banner.svg`
+pub const BTOP_MAIN_BG: Color = Color::Rgb(11, 13, 20); // #0b0d14
+pub const BTOP_MAIN_FG: Color = Color::Rgb(226, 232, 248); // #e2e8f8
+pub const BTOP_TITLE: Color = Color::Rgb(245, 243, 255); // #f5f3ff
+pub const BTOP_HI_FG: Color = Color::Rgb(244, 114, 182); // #f472b6 (SVG stop 1.0 Pink)
+pub const BTOP_SELECTED_BG: Color = Color::Rgb(58, 44, 92); // #3a2c5c
 pub const BTOP_SELECTED_FG: Color = Color::Rgb(255, 255, 255); // #ffffff
-pub const BTOP_INACTIVE_FG: Color = Color::Rgb(64, 64, 64); // #404040
-pub const BTOP_GRAPH_TEXT: Color = Color::Rgb(144, 144, 144); // #909090
-pub const BTOP_PROC_MISC: Color = Color::Rgb(13, 231, 86); // #0de756
+pub const BTOP_INACTIVE_FG: Color = Color::Rgb(52, 58, 84); // #343a54
+pub const BTOP_GRAPH_TEXT: Color = Color::Rgb(148, 156, 190); // #949cbe
+pub const BTOP_PROC_MISC: Color = Color::Rgb(56, 189, 248); // #38bdf8 (SVG stop 0.0 Sky)
 
-pub const BTOP_CPU_BOX: Color = Color::Rgb(85, 123, 91); // #557b5b
-pub const BTOP_MEM_BOX: Color = Color::Rgb(138, 136, 88); // #8a8858
-pub const BTOP_NET_BOX: Color = Color::Rgb(130, 89, 120); // #825978
-pub const BTOP_PROC_BOX: Color = Color::Rgb(73, 109, 138); // #496d8a
-pub const BTOP_DIV_LINE: Color = Color::Rgb(48, 48, 48); // #303030
+// Box border accents derived from the 3 SVG stops (#38bdf8, #a78bfa, #f472b6)
+pub const BTOP_CPU_BOX: Color = Color::Rgb(56, 189, 248); // #38bdf8 Sky
+pub const BTOP_MEM_BOX: Color = Color::Rgb(167, 139, 250); // #a78bfa Violet
+pub const BTOP_NET_BOX: Color = Color::Rgb(244, 114, 182); // #f472b6 Pink
+pub const BTOP_PROC_BOX: Color = Color::Rgb(112, 164, 249); // Midpoint Sky-Violet
+pub const BTOP_DIV_LINE: Color = Color::Rgb(24, 27, 42); // #181b2a
 
 pub type RgbStop = (u8, u8, u8);
 pub type Grad3 = (RgbStop, RgbStop, RgbStop);
 
-pub const GRAD_CPU: Grad3 = ((80, 247, 108), (242, 226, 70), (250, 47, 47));
-pub const GRAD_TEMP: Grad3 = ((72, 151, 212), (84, 116, 232), (255, 64, 182));
-pub const GRAD_MEM: Grad3 = ((91, 114, 250), (124, 159, 254), (217, 248, 255));
-pub const GRAD_DL: Grad3 = ((41, 69, 150), (53, 121, 198), (163, 216, 255));
-pub const GRAD_UL: Grad3 = ((114, 28, 101), (177, 72, 163), (255, 118, 238));
+// Primary MPDC Banner SVG 3-stop linear gradient: #38bdf8 -> #a78bfa -> #f472b6
+pub const GRAD_MPDC: Grad3 = ((56, 189, 248), (167, 139, 250), (244, 114, 182));
+pub const GRAD_CPU: Grad3 = GRAD_MPDC;
+pub const GRAD_TEMP: Grad3 = ((56, 189, 248), (167, 139, 250), (244, 114, 182));
+pub const GRAD_MEM: Grad3 = ((56, 189, 248), (167, 139, 250), (244, 114, 182));
+pub const GRAD_DL: Grad3 = ((56, 189, 248), (167, 139, 250), (244, 114, 182));
+pub const GRAD_UL: Grad3 = ((167, 139, 250), (205, 126, 216), (244, 114, 182));
 
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)).round() as u8
@@ -84,7 +88,7 @@ pub fn btop_spark_spans(values: &[f64], width: usize, grad: Grad3) -> Vec<Span<'
     for &v in tail {
         let norm = ((v - lo) / span).clamp(0.0, 1.0);
         let idx = ((norm * (BARS.len() - 1) as f64).round() as usize).min(BARS.len() - 1);
-        let col = sample_grad(grad, 0.20 + 0.80 * norm as f32);
+        let col = sample_grad(grad, norm as f32);
         out.push(Span::styled(
             BARS[idx].to_string(),
             Style::default().fg(col).add_modifier(Modifier::BOLD),

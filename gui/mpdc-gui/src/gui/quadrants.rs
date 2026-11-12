@@ -5,13 +5,13 @@ use crate::{
     gui::{
         theme::{
             draw_led, draw_segmented_meter, section_header, ACCENT_CYAN, ACCENT_STEEL, BG_PANEL,
-            STATUS_ERR, STATUS_OK, STATUS_WARN, TEXT_MUTED, TEXT_PRIMARY,
+            STATUS_ERR, STATUS_OK, SVG_PINK, SVG_SKY, SVG_VIOLET, TEXT_MUTED, TEXT_PRIMARY,
         },
         MpdcWorkbenchApp,
     },
     models::{ClientNode, SkillItem},
 };
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 use egui_plot::{Bar, BarChart, Plot};
 
 impl MpdcWorkbenchApp {
@@ -126,9 +126,9 @@ impl MpdcWorkbenchApp {
                                         (tps / 100.0) as f32,
                                         58.0,
                                         12.0,
-                                        Color32::from_rgb(40, 140, 80),
-                                        Color32::from_rgb(80, 210, 120),
-                                        Color32::from_rgb(220, 190, 50),
+                                        SVG_SKY,
+                                        SVG_VIOLET,
+                                        SVG_PINK,
                                         &format!("{tps:4.1}"),
                                     );
 
@@ -139,9 +139,9 @@ impl MpdcWorkbenchApp {
                                         share,
                                         46.0,
                                         12.0,
-                                        Color32::from_rgb(40, 95, 180),
-                                        Color32::from_rgb(70, 150, 235),
-                                        Color32::from_rgb(150, 215, 255),
+                                        SVG_SKY,
+                                        SVG_VIOLET,
+                                        SVG_PINK,
                                         &format!("{:2.0}%", share * 100.0),
                                     );
 
@@ -404,9 +404,9 @@ impl MpdcWorkbenchApp {
                                         s.utility_score as f32,
                                         52.0,
                                         12.0,
-                                        STATUS_ERR,
-                                        STATUS_WARN,
-                                        STATUS_OK,
+                                        SVG_SKY,
+                                        SVG_VIOLET,
+                                        SVG_PINK,
                                         &format!("{:.2}", s.utility_score),
                                     );
                                     ui.label(RichText::new(&s.domain).color(TEXT_MUTED));
@@ -505,9 +505,9 @@ impl MpdcWorkbenchApp {
                                             a.replay_pass_rate as f32,
                                             52.0,
                                             12.0,
-                                            STATUS_ERR,
-                                            STATUS_WARN,
-                                            STATUS_OK,
+                                            SVG_SKY,
+                                            SVG_VIOLET,
+                                            SVG_PINK,
                                             &format!("{:.0}%", a.replay_pass_rate * 100.0),
                                         );
                                         ui.label(format!("{:.2}", a.holdout_perplexity));

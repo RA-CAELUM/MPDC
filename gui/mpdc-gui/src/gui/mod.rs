@@ -10,8 +10,7 @@ use crate::{
         format_client_opencode_json, spawn_poll_overview, spawn_post_action, BgResult,
     },
     gui::theme::{
-        apply_workbench_style, draw_led, ACCENT_CYAN, STATUS_OK, STATUS_WARN, TEXT_MUTED,
-        TEXT_PRIMARY,
+        apply_workbench_style, draw_led, svg_gradient_text, STATUS_OK, STATUS_WARN, TEXT_MUTED,
     },
     models::{AdapterItem, AgentRoleParams, OverviewPayload},
 };
@@ -445,11 +444,7 @@ impl eframe::App for MpdcWorkbenchApp {
         egui::TopBottomPanel::top("wb_top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 draw_led(ui, if self.connected { STATUS_OK } else { STATUS_WARN });
-                ui.label(
-                    RichText::new("MPDC::WORKBENCH v0.2")
-                        .color(TEXT_PRIMARY)
-                        .strong(),
-                );
+                ui.label(svg_gradient_text("MPDC // MAN PORTABLE DATA CENTER", 11.5));
                 ui.separator();
 
                 ui.label(RichText::new("URI").color(TEXT_MUTED));
@@ -514,8 +509,8 @@ impl eframe::App for MpdcWorkbenchApp {
                     .filter(|n| n.status != "paused" && self.master_tx_enabled)
                     .map(|n| n.last_tok_per_sec)
                     .sum();
-                ui.label(
-                    RichText::new(format!(
+                ui.label(svg_gradient_text(
+                    &format!(
                         "ENG={} | BACKBONE={} | ACTIVE_LORA={} | CLUSTER_RATE={:.1} tok/s | TOTAL_OUT={} | TOTAL_IN={} | PASS@1={:.1}% | PSR={:.1}%",
                         self.selected_engine.to_uppercase(),
                         self.overview.server.base_model,
@@ -525,9 +520,9 @@ impl eframe::App for MpdcWorkbenchApp {
                         self.overview.server.total_prompt_tokens,
                         self.overview.scorecard.pass_at_1 * 100.0,
                         self.overview.scorecard.mean_patch_survival_rate * 100.0,
-                    ))
-                    .color(ACCENT_CYAN),
-                );
+                    ),
+                    10.5,
+                ));
             });
         });
 

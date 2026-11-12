@@ -1,19 +1,31 @@
-//! Industrial Telemetry & Profiler Workbench styling, custom painter LEDs, and segmented meters.
+//! MPDC Banner SVG (`#38bdf8 -> #a78bfa -> #f472b6`) Industrial Telemetry & Profiler Workbench styling.
 
-use eframe::egui::{self, Color32, FontFamily, FontId, Pos2, Rect, RichText, Sense, Stroke, TextStyle, Vec2};
+use eframe::egui::{
+    self, text::LayoutJob, Color32, FontFamily, FontId, Pos2, Rect, RichText, Sense, Stroke,
+    TextFormat, TextStyle, Vec2,
+};
 
-pub const BG_ROOT: Color32 = Color32::from_rgb(13, 15, 18);
-pub const BG_PANEL: Color32 = Color32::from_rgb(19, 22, 27);
-pub const BG_WELL: Color32 = Color32::from_rgb(10, 12, 15);
-pub const BG_HEADER: Color32 = Color32::from_rgb(26, 30, 37);
-pub const BORDER_CRISP: Color32 = Color32::from_rgb(44, 50, 62);
-pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(216, 222, 233);
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(130, 142, 160);
-pub const ACCENT_STEEL: Color32 = Color32::from_rgb(56, 132, 210);
-pub const ACCENT_CYAN: Color32 = Color32::from_rgb(0, 185, 215);
-pub const STATUS_OK: Color32 = Color32::from_rgb(46, 168, 86);
-pub const STATUS_WARN: Color32 = Color32::from_rgb(218, 150, 35);
-pub const STATUS_ERR: Color32 = Color32::from_rgb(215, 60, 60);
+// Primary 3-stop gradient palette from `assets/mpdc-banner.svg`
+pub const SVG_SKY: Color32 = Color32::from_rgb(56, 189, 248); // #38bdf8 (stop 0.0)
+pub const SVG_VIOLET: Color32 = Color32::from_rgb(167, 139, 250); // #a78bfa (stop 0.5)
+pub const SVG_PINK: Color32 = Color32::from_rgb(244, 114, 182); // #f472b6 (stop 1.0)
+
+// Deep slate-violet workbench surfaces tuned to contrast with the SVG gradient
+pub const BG_ROOT: Color32 = Color32::from_rgb(11, 13, 20);
+pub const BG_PANEL: Color32 = Color32::from_rgb(17, 20, 30);
+pub const BG_WELL: Color32 = Color32::from_rgb(8, 10, 16);
+pub const BG_HEADER: Color32 = Color32::from_rgb(24, 27, 42);
+pub const BORDER_CRISP: Color32 = Color32::from_rgb(56, 62, 92);
+pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(232, 236, 250);
+pub const TEXT_MUTED: Color32 = Color32::from_rgb(148, 156, 190);
+
+// Semantic aliases mapped to the SVG palette
+pub const ACCENT_CYAN: Color32 = SVG_SKY;
+pub const ACCENT_STEEL: Color32 = SVG_VIOLET;
+pub const ACCENT_PINK: Color32 = SVG_PINK;
+pub const STATUS_OK: Color32 = SVG_SKY;
+pub const STATUS_WARN: Color32 = SVG_VIOLET;
+pub const STATUS_ERR: Color32 = SVG_PINK;
 
 pub fn apply_workbench_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
@@ -25,14 +37,15 @@ pub fn apply_workbench_style(ctx: &egui::Context) {
     style.visuals.panel_fill = BG_ROOT;
     style.visuals.window_fill = BG_PANEL;
     style.visuals.extreme_bg_color = BG_WELL;
-    style.visuals.faint_bg_color = Color32::from_rgb(22, 26, 32);
+    style.visuals.faint_bg_color = Color32::from_rgb(22, 25, 38);
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER_CRISP);
-    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(28, 33, 41);
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(52, 60, 74));
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(40, 52, 70);
-    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_STEEL);
-    style.visuals.widgets.active.bg_fill = ACCENT_STEEL;
-    style.visuals.selection.bg_fill = Color32::from_rgb(38, 78, 128);
+    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(28, 32, 48);
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(68, 74, 110));
+    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(44, 46, 74);
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, SVG_SKY);
+    style.visuals.widgets.active.bg_fill = SVG_VIOLET;
+    style.visuals.selection.bg_fill = Color32::from_rgb(66, 54, 115);
+    style.visuals.selection.stroke = Stroke::new(1.0, SVG_SKY);
 
     style.text_styles = [
         (TextStyle::Heading, FontId::new(12.5, FontFamily::Monospace)),
@@ -45,6 +58,44 @@ pub fn apply_workbench_style(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+pub fn lerp_c(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    Color32::from_rgb(
+        (a.r() as f32 + (b.r() as f32 - a.r() as f32) * t) as u8,
+        (a.g() as f32 + (b.g() as f32 - a.g() as f32) * t) as u8,
+        (a.b() as f32 + (b.b() as f32 - a.b() as f32) * t) as u8,
+    )
+}
+
+pub fn sample_svg_gradient(pos: f32) -> Color32 {
+    let p = pos.clamp(0.0, 1.0);
+    if p < 0.5 {
+        lerp_c(SVG_SKY, SVG_VIOLET, p * 2.0)
+    } else {
+        lerp_c(SVG_VIOLET, SVG_PINK, (p - 0.5) * 2.0)
+    }
+}
+
+pub fn svg_gradient_text(text: &str, font_size: f32) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len().saturating_sub(1).max(1) as f32;
+    for (i, ch) in chars.into_iter().enumerate() {
+        let col = sample_svg_gradient(i as f32 / len);
+        let mut s = [0u8; 4];
+        job.append(
+            ch.encode_utf8(&mut s),
+            0.0,
+            TextFormat {
+                font_id: FontId::new(font_size, FontFamily::Monospace),
+                color: col,
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
 pub fn draw_led(ui: &mut egui::Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(8.0, 10.0), Sense::hover());
     if ui.is_rect_visible(rect) {
@@ -53,15 +104,6 @@ pub fn draw_led(ui: &mut egui::Ui, color: Color32) {
         ui.painter()
             .rect_stroke(sq, 1.0, Stroke::new(1.0, Color32::BLACK));
     }
-}
-
-fn lerp_c(a: Color32, b: Color32, t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    Color32::from_rgb(
-        (a.r() as f32 + (b.r() as f32 - a.r() as f32) * t) as u8,
-        (a.g() as f32 + (b.g() as f32 - a.g() as f32) * t) as u8,
-        (a.b() as f32 + (b.b() as f32 - a.b() as f32) * t) as u8,
-    )
 }
 
 pub fn draw_segmented_meter(
@@ -108,19 +150,31 @@ pub fn draw_segmented_meter(
 }
 
 pub fn section_header(ui: &mut egui::Ui, code: &str, title: &str) {
-    egui::Frame::none()
+    let resp = egui::Frame::none()
         .fill(BG_HEADER)
         .stroke(Stroke::new(1.0, BORDER_CRISP))
-        .inner_margin(egui::Margin::symmetric(5.0, 2.0))
+        .inner_margin(egui::Margin::symmetric(5.0, 2.5))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("[{code}]"))
-                        .color(ACCENT_CYAN)
-                        .strong(),
-                );
-                ui.label(RichText::new(title).color(TEXT_PRIMARY).strong());
+                ui.label(RichText::new(format!("[{code}]")).color(SVG_SKY).strong());
+                ui.label(svg_gradient_text(title, 10.5));
             });
         });
+
+    // Draw thin 3-stop SVG gradient accent line along the bottom of each section header
+    let r = resp.response.rect;
+    if ui.is_rect_visible(r) {
+        let p = ui.painter();
+        let steps = 24usize;
+        let step_w = r.width() / steps as f32;
+        for i in 0..steps {
+            let pos = i as f32 / (steps - 1) as f32;
+            let seg = Rect::from_min_size(
+                Pos2::new(r.left() + i as f32 * step_w, r.bottom() - 1.5),
+                Vec2::new(step_w + 0.5, 1.5),
+            );
+            p.rect_filled(seg, 0.0, sample_svg_gradient(pos));
+        }
+    }
 }

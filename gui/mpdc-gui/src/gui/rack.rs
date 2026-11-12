@@ -2,12 +2,15 @@
 
 use crate::{
     gui::{
-        theme::{draw_segmented_meter, section_header, ACCENT_CYAN, BG_PANEL, TEXT_MUTED, TEXT_PRIMARY},
+        theme::{
+            draw_segmented_meter, section_header, ACCENT_CYAN, BG_PANEL, SVG_PINK, SVG_SKY,
+            SVG_VIOLET, TEXT_MUTED, TEXT_PRIMARY,
+        },
         MpdcWorkbenchApp,
     },
     models::AdapterItem,
 };
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 
 impl MpdcWorkbenchApp {
     pub fn render_left_hardware_and_engine_rack(&mut self, ui: &mut egui::Ui) {
@@ -23,9 +26,9 @@ impl MpdcWorkbenchApp {
                     g.gpu_util_pct as f32,
                     w,
                     13.0,
-                    Color32::from_rgb(46, 168, 86),
-                    Color32::from_rgb(220, 185, 45),
-                    Color32::from_rgb(220, 60, 50),
+                    SVG_SKY,
+                    SVG_VIOLET,
+                    SVG_PINK,
                     &format!("GPU_CORE {:3.0}% | TEMP {:.0}C", g.gpu_util_pct * 100.0, g.temp_c),
                 );
                 draw_segmented_meter(
@@ -33,9 +36,9 @@ impl MpdcWorkbenchApp {
                     g.vram_pct as f32,
                     w,
                     13.0,
-                    Color32::from_rgb(50, 115, 220),
-                    Color32::from_rgb(90, 160, 245),
-                    Color32::from_rgb(180, 225, 255),
+                    SVG_SKY,
+                    SVG_VIOLET,
+                    SVG_PINK,
                     &format!(
                         "VRAM {:.0}/{:.0} MB ({:.0}%)",
                         g.vram_used_mb,
@@ -48,9 +51,9 @@ impl MpdcWorkbenchApp {
                     g.kv_cache_pct as f32,
                     w,
                     13.0,
-                    Color32::from_rgb(35, 95, 175),
-                    Color32::from_rgb(0, 175, 215),
-                    Color32::from_rgb(120, 235, 215),
+                    SVG_SKY,
+                    SVG_VIOLET,
+                    SVG_PINK,
                     &format!(
                         "KV_CACHE {:3.0}% ({})",
                         g.kv_cache_pct * 100.0,
@@ -63,9 +66,9 @@ impl MpdcWorkbenchApp {
                     pwr_ratio,
                     w,
                     13.0,
-                    Color32::from_rgb(46, 168, 86),
-                    Color32::from_rgb(220, 160, 40),
-                    Color32::from_rgb(225, 55, 50),
+                    SVG_SKY,
+                    SVG_VIOLET,
+                    SVG_PINK,
                     &format!("PWR {:.1}W / {:.0}W CAP", g.power_w, self.power_limit_w),
                 );
 

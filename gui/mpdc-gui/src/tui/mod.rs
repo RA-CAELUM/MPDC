@@ -6,7 +6,7 @@ pub mod theme;
 use crate::{
     client::{spawn_poll_overview, BgResult},
     models::{AdapterItem, OverviewPayload},
-    tui::theme::{btop_key_label, BTOP_DIV_LINE, BTOP_HI_FG, BTOP_MAIN_BG},
+    tui::theme::{btop_key_label, BTOP_DIV_LINE, BTOP_MAIN_BG},
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -240,10 +240,10 @@ impl BtopTuiApp {
 
         let mut footer_spans = vec![
             Span::styled(
-                " btop++ // MPDC ",
+                " MPDC // Man Portable Data Center ",
                 Style::default()
-                    .bg(BTOP_HI_FG)
-                    .fg(Color::Black)
+                    .bg(Color::Rgb(167, 139, 250))
+                    .fg(Color::Rgb(11, 13, 20))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
