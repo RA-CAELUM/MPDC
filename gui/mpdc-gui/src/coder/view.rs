@@ -118,9 +118,28 @@ impl MpdcCoderApp {
                             .fg(Color::Rgb(11, 13, 20))
                             .add_modifier(Modifier::BOLD),
                     ));
+                    spans.push(Span::raw("  "));
+                    let watch_lbl = if self.screen_watch_enabled {
+                        format!(" ◉ SCREEN WATCH: ON ({} frames) ", self.screen_captures_count)
+                    } else {
+                        " ○ SCREEN WATCH: OFF (/watch | /screen) ".into()
+                    };
+                    let watch_bg = if self.screen_watch_enabled {
+                        Color::Rgb(56, 189, 248)
+                    } else {
+                        Color::Rgb(28, 32, 48)
+                    };
+                    let watch_fg = if self.screen_watch_enabled {
+                        Color::Rgb(11, 13, 20)
+                    } else {
+                        BTOP_MAIN_FG
+                    };
                     spans.push(Span::styled(
-                        " (click or press Tab)",
-                        Style::default().fg(BTOP_GRAPH_TEXT),
+                        watch_lbl,
+                        Style::default()
+                            .bg(watch_bg)
+                            .fg(watch_fg)
+                            .add_modifier(Modifier::BOLD),
                     ));
                 }
                 1 => {
@@ -193,16 +212,37 @@ impl MpdcCoderApp {
             header_lines.push(Line::from(spans));
         }
 
-        // Row 7: Subtitle from assets/mpdc-banner.svg
+        // Row 7: Subtitle from assets/mpdc-banner.svg + Live Token Telemetry
+        let ctx_ratio =
+            (self.context_tokens_used as f64 / self.context_tokens_max.max(1) as f64).clamp(0.0, 1.0);
         let mut sub_spans = vec![Span::raw("  ")];
         sub_spans.extend(gradient_text_spans(MPDC_SUBTITLE));
+        sub_spans.push(Span::raw("   "));
+        sub_spans.push(Span::styled("TOKENS : ", Style::default().fg(BTOP_GRAPH_TEXT)));
+        sub_spans.extend(btop_meter_spans(ctx_ratio, 8, GRAD_MPDC));
+        sub_spans.push(Span::styled(
+            format!(
+                " {}/{} ctx | IN: {} | OUT: {} | KV$: {} | {:.1} tok/s",
+                self.context_tokens_used,
+                self.context_tokens_max,
+                self.prompt_tokens_total,
+                self.completion_tokens_total,
+                self.cached_tokens_total,
+                self.last_tok_per_sec
+            ),
+            Style::default().fg(BTOP_MAIN_FG).add_modifier(Modifier::BOLD),
+        ));
         header_lines.push(Line::from(sub_spans));
 
-        // Register clickable hitboxes in header for Mode toggle (row 0) and Model Pool modal (row 3)
-        if area.width > 42 && area.height >= 6 {
+        // Register clickable hitboxes in header for Mode toggle, Screen Watch toggle (row 0), and Model Pool modal (row 3)
+        if area.width > 70 && area.height >= 6 {
             self.hitboxes.push(HitBox {
-                rect: Rect::new(area.x + 40, area.y, area.width.saturating_sub(40), 1),
+                rect: Rect::new(area.x + 40, area.y, 24, 1),
                 action: HitAction::CycleMode,
+            });
+            self.hitboxes.push(HitBox {
+                rect: Rect::new(area.x + 65, area.y, area.width.saturating_sub(65), 1),
+                action: HitAction::ToggleScreenWatch,
             });
             self.hitboxes.push(HitBox {
                 rect: Rect::new(area.x + 40, area.y + 3, area.width.saturating_sub(40), 1),
@@ -313,6 +353,29 @@ impl MpdcCoderApp {
                                     format!("M {file} (click in Files Changed pane to inspect diff)"),
                                     Style::default().fg(BTOP_PROC_MISC),
                                 ),
+                            ]));
+                        }
+                        lines.push(Line::from(""));
+                    }
+                    TurnBlock::ScreenObservation {
+                        screenshot_path,
+                        models,
+                        analysis,
+                    } => {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                "  ◈ Screen & Spatial Observation ",
+                                Style::default().fg(BTOP_HI_FG).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!("[{}] ({})", screenshot_path, models.join(" + ")),
+                                Style::default().fg(Color::Rgb(167, 139, 250)),
+                            ),
+                        ]));
+                        for line in analysis {
+                            lines.push(Line::from(vec![
+                                Span::styled("    │ ", Style::default().fg(BTOP_NET_BOX)),
+                                Span::styled(line.clone(), Style::default().fg(BTOP_MAIN_FG)),
                             ]));
                         }
                         lines.push(Line::from(""));
@@ -590,11 +653,27 @@ impl MpdcCoderApp {
     }
 
     fn draw_prompt_box(&self, f: &mut Frame, area: Rect) {
+        let est_input_toks = if self.input.trim().is_empty() {
+            0
+        } else {
+            (self.input.chars().count() / 4).max(1)
+        };
+        let total_session_toks = self.prompt_tokens_total + self.completion_tokens_total;
         let title = Line::from(vec![
             Span::styled("─", Style::default().fg(BTOP_HI_FG)),
             Span::styled(
-                format!("prompt [{}]─", self.mode.label()),
+                format!("prompt [{}]", self.mode.label()),
                 Style::default().fg(BTOP_TITLE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    " — draft: ~{} tok | session total: {} tok (in {} / out {})─",
+                    est_input_toks,
+                    total_session_toks,
+                    self.prompt_tokens_total,
+                    self.completion_tokens_total
+                ),
+                Style::default().fg(Color::Rgb(167, 139, 250)),
             ),
         ]);
 

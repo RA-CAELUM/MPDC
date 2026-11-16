@@ -66,9 +66,12 @@ mpdc-code
 | **`Ctrl+Y`** or `/apply` | Accept & apply the proposed code diff, run verification, and harvest the trajectory |
 | `/plan <task>` | Architect a step-by-step plan using `qwen3-architect` (`<think>`) + Tier 1 Episodic Skills |
 | `/code <task>` | Synthesize a code patch across active Programming Pool models |
-| `/spatial <path>` | Attach an image, video frame, depth map, or point cloud (`.ply`/`.pcd`) for 3D scene grounding |
+| `/screen [query]` | Capture a live screenshot of your desktop/sim window and analyze with the Visual/Spatial Pool |
+| `/watch` | Toggle continuous background screen monitoring (`SCREEN WATCH: ON/OFF`) for Spatial AI |
+| `/resume` | Restore the previous session (`.mpdc_session.json`) including chat, plan steps, and diffs |
+| `/export [file.md]` | Export the full session transcript, plan checklist, and unified file diffs to Markdown |
 | `/clear` | Clear the session transcript |
-| **`Esc` / `Ctrl+C`** | Exit `mpdc-code` |
+| `/exit` (or `Esc`) | Save session state to `.mpdc_session.json` and exit `mpdc-code` |
 
 #### One-Shot CLI Mode
 You can also run multi-agent tasks non-interactively from the command line:
