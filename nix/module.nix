@@ -16,14 +16,14 @@ in
 
     backendUrl = mkOption {
       type = types.str;
-      default = "http://127.0.0.1:8001/v1";
-      description = "Upstream vLLM / SGLang inference engine endpoint.";
+      default = "http://127.0.0.1:11434/v1";
+      description = "Upstream OpenAI-compatible inference endpoint (Ollama by default; vLLM / SGLang / llama.cpp also work).";
     };
 
     baseModel = mkOption {
       type = types.str;
-      default = "Qwen/Qwen3-8B-AWQ";
-      description = "Primary Qwen3 model backbone served by the inference engine.";
+      default = "mpdc-qwen3-4b";
+      description = "Model name served by the inference engine (default: Qwen3-4B-Instruct-2507 via scripts/setup-ollama-model.sh).";
     };
 
     dataDir = mkOption {
@@ -65,6 +65,8 @@ in
         MPDC_DATA_DIR = cfg.dataDir;
         MPDC_BACKEND_URL = cfg.backendUrl;
         MPDC_BASE_MODEL = cfg.baseModel;
+        # Qwen3 Instruct-2507 models have no /think switch.
+        MPDC_THINKING_TOGGLE = "0";
       };
       serviceConfig = {
         ExecStart = "${pkgs.python312}/bin/python -m mpdc.cli serve --host 0.0.0.0 --port ${toString cfg.port}";

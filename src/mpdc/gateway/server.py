@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from typing import Any, AsyncGenerator, Optional
@@ -77,6 +78,78 @@ class SwarmExecuteRequest(BaseModel):
     spatial_models: Optional[list[str]] = None
     coordination_mode: Optional[str] = None
     client_node: str = "mpdc-cli"
+
+
+_THINK_DIRECTIVE = re.compile(r"(?m)^[ \t]*/(?:no_)?think[ \t]*$\n?")
+
+
+def strip_think_directives(text: str) -> str:
+    """Remove standalone /think and /no_think lines (Qwen3 soft switches)."""
+    return _THINK_DIRECTIVE.sub("", text).rstrip("\n") if "think" in text else text
+
+
+_CHATML_STOPS = ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
+
+
+def _ollama_root(backend_url: str) -> str:
+    root = backend_url.rstrip("/")
+    return root[: -len("/v1")] if root.endswith("/v1") else root
+
+
+def render_chatml(messages: list[dict[str, Any]]) -> str:
+    """Qwen ChatML with the final assistant turn left open for continuation."""
+    parts: list[str] = []
+    last = len(messages) - 1
+    for i, m in enumerate(messages):
+        role = m["role"] if m["role"] in ("system", "user", "assistant") else "user"
+        content = m.get("content") or ""
+        if i == last and role == "assistant":
+            parts.append(f"<|im_start|>assistant\n{content}")
+        else:
+            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+    if messages and messages[-1]["role"] != "assistant":
+        parts.append("<|im_start|>assistant\n")
+    return "".join(parts)
+
+
+def build_ollama_raw_payload(
+    model: str,
+    messages: list[dict[str, Any]],
+    temperature: float,
+    max_tokens: Optional[int],
+    passthrough: dict[str, Any],
+) -> dict[str, Any]:
+    stop = passthrough.get("stop") or []
+    if isinstance(stop, str):
+        stop = [stop]
+    options: dict[str, Any] = {"temperature": temperature, "stop": list(stop) + _CHATML_STOPS}
+    if passthrough.get("top_p") is not None:
+        options["top_p"] = passthrough["top_p"]
+    if max_tokens is not None:
+        options["num_predict"] = max_tokens
+    # num_ctx comes from the model's Modelfile (32k for mpdc-qwen3-4b).
+    return {"model": model, "prompt": render_chatml(messages), "raw": True, "stream": False, "options": options}
+
+
+def ollama_raw_to_openai(r: dict[str, Any], model: str) -> dict[str, Any]:
+    prompt_tokens = int(r.get("prompt_eval_count") or 0)
+    completion_tokens = int(r.get("eval_count") or 0)
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": r.get("response", "")},
+            "finish_reason": "length" if r.get("done_reason") == "length" else "stop",
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
 
 
 def build_mpdc_native_client_profile(
@@ -227,7 +300,7 @@ def create_gateway_app(config: Optional[MPDCConfig] = None) -> FastAPI:
         )
         skill_block = format_skill_block(skills)
 
-        use_thinking = req.model != "qwen3-mpdc-fast"
+        use_thinking = req.model != "qwen3-mpdc-fast" and cfg.inference.thinking_toggle
         thinking_directive = "/think\n" if use_thinking else "/no_think\n"
 
         augmented_messages: list[dict[str, Any]] = []
@@ -243,7 +316,15 @@ def create_gateway_app(config: Optional[MPDCConfig] = None) -> FastAPI:
         if not injected_system and skill_block:
             augmented_messages.insert(0, {"role": "system", "content": skill_block})
 
+        if not cfg.inference.thinking_toggle:
+            # Model has no /think switch: remove directives clients add (SICA appends /no_think).
+            for m in augmented_messages:
+                if m["role"] == "user" and isinstance(m.get("content"), str):
+                    m["content"] = strip_think_directives(m["content"])
+
         for idx in range(len(augmented_messages) - 1, -1, -1):
+            if not cfg.inference.thinking_toggle:
+                break
             if augmented_messages[idx]["role"] == "user":
                 content = augmented_messages[idx]["content"] or ""
                 # Respect a caller's own directive anywhere in the message (SICA
@@ -342,11 +423,28 @@ def create_gateway_app(config: Optional[MPDCConfig] = None) -> FastAPI:
         if req.max_tokens is not None:
             upstream_payload["max_tokens"] = req.max_tokens
 
+        use_raw_prefill = (
+            cfg.inference.engine == "ollama"
+            and augmented_messages
+            and augmented_messages[-1]["role"] == "assistant"
+        )
+        if use_raw_prefill:
+            # Ollama's chat APIs restart a trailing assistant message instead of
+            # continuing it (SICA's tool loop relies on continuation), so render
+            # the ChatML prompt ourselves and use raw generation.
+            call_url = f"{_ollama_root(cfg.inference.backend_url)}/api/generate"
+            call_payload: dict[str, Any] = build_ollama_raw_payload(
+                upstream_model, augmented_messages, req.temperature, req.max_tokens, passthrough
+            )
+        else:
+            call_url = upstream_url
+            call_payload = upstream_payload
+
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
                 resp = await client.post(
-                    upstream_url,
-                    json=upstream_payload,
+                    call_url,
+                    json=call_payload,
                     headers={"Authorization": f"Bearer {cfg.inference.api_key}"},
                 )
         except Exception as exc:
@@ -354,7 +452,7 @@ def create_gateway_app(config: Optional[MPDCConfig] = None) -> FastAPI:
             raise HTTPException(
                 status_code=502,
                 detail={
-                    "error": f"upstream {upstream_url} (model={upstream_model}) unreachable: {exc}",
+                    "error": f"upstream {call_url} (model={upstream_model}) unreachable: {exc}",
                     "skills_injected": len(skills),
                 },
             )
@@ -362,12 +460,14 @@ def create_gateway_app(config: Optional[MPDCConfig] = None) -> FastAPI:
             raise HTTPException(
                 status_code=502,
                 detail={
-                    "error": f"upstream {upstream_url} (model={upstream_model}) returned "
+                    "error": f"upstream {call_url} (model={upstream_model}) returned "
                              f"{resp.status_code}: {resp.text[:2000]}",
                     "skills_injected": len(skills),
                 },
             )
-        completion = resp.json()
+        completion = (
+            ollama_raw_to_openai(resp.json(), upstream_model) if use_raw_prefill else resp.json()
+        )
 
         usage = completion.get("usage") or {}
         p_tok = int(usage.get("prompt_tokens", prompt_tok_est))

@@ -3,7 +3,7 @@
 pub mod sica;
 pub mod view;
 
-use crate::models::{OverviewPayload, PoolWorkerItem};
+use crate::models::{ModelPoolsPayload, OverviewPayload, PoolWorkerItem};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -161,6 +161,9 @@ pub enum CoderBgMsg {
         vram_total_mb: f64,
         temp_c: f64,
         gateway_online: bool,
+        /// Live model pools / server info from the gateway (None if unreachable).
+        pools: Option<ModelPoolsPayload>,
+        server: Option<(String, String, String, String)>,
     },
 }
 
@@ -373,19 +376,18 @@ fn build_sica_task(
     plan_only: bool,
     approved_plan: Option<&str>,
 ) -> String {
+    let local = sica::agent_mode() == "local";
     let mut t = format!(
-        "You are working directly on the user's machine in the project directory `{cwd}`. \
-         Use absolute paths inside this directory for every file and command.\n\n"
+        "Project directory: `{cwd}` (on the user's machine; all paths are relative to it).\n\n"
     );
     if plan_only {
         t.push_str(
-            "PLANNING ONLY: do NOT create, modify or delete any files, and do not run commands \
-             that change state. Inspect the project as needed, then submit (via submit_answer) a \
-             concrete, numbered implementation plan: which files to change, what to change in \
-             each, and the exact commands that will verify the result.\n\n",
+            "PLANNING ONLY: do not create, modify or delete files. Inspect the project as needed, \
+             then finish with a concrete, numbered implementation plan: which files to change, \
+             what to change in each, and the exact commands that will verify the result.\n\n",
         );
     }
-    if mode == CoderMode::SpatialSwarm {
+    if mode == CoderMode::SpatialSwarm && !local {
         t.push_str(
             "This task may involve visual or 3D spatial reasoning: delegate coordinate-frame, \
              geometry or scene analysis to the spatial_visual_specialist sub-agent where useful.\n\n",
@@ -398,12 +400,34 @@ fn build_sica_task(
         t.push_str(plan);
     }
     if !plan_only {
-        t.push_str(
+        t.push_str(if local {
+            "\n\nWhen the change is done, run the project's tests or build, fix any failures, \
+             then finish with a short summary."
+        } else {
             "\n\nWhen finished, build the project and run its tests to verify your work, fix any \
-             failures, then submit a short summary of what you changed via submit_answer.",
-        );
+             failures, then submit a short summary of what you changed via submit_answer."
+        });
     }
     t
+}
+
+/// Follow-up task after the independent check failed.
+fn build_fix_task(original_task: &str, v: &VerifyReport) -> String {
+    format!(
+        "{original_task}\n\nA previous attempt already changed the project, but an independent \
+         check (`{}`) FAILED:\n{}\n\nFind the cause and fix it: fix the code, or fix a test whose \
+         expectation contradicts the task description. Then run the check again and finish.",
+        v.tool.trim_start_matches("verify:"),
+        v.lines.join("\n")
+    )
+}
+
+fn patch_text(changes: &[FileChangeEntry]) -> String {
+    changes
+        .iter()
+        .flat_map(|c| c.diff_lines.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 struct VerifyReport {
@@ -421,6 +445,20 @@ fn tail_lines(text: &str, n: usize) -> Vec<String> {
         .collect()
 }
 
+fn has_python_tests(root: &Path) -> bool {
+    if root.join("tests").is_dir() || root.join("test").is_dir() {
+        return true;
+    }
+    fs::read_dir(root)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.ends_with(".py") && (n.starts_with("test_") || n.ends_with("_test.py"))
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Independent post-run check. Reports failures as failures.
 fn run_live_project_verification(cwd: &str, lang: ProjectLang) -> VerifyReport {
     let root = Path::new(cwd);
@@ -430,8 +468,9 @@ fn run_live_project_verification(cwd: &str, lang: ProjectLang) -> VerifyReport {
             c.args(["test", "--quiet"]);
             ("cargo test", c)
         }
-        ProjectLang::Python if root.join("tests").is_dir() => {
-            let mut c = Command::new("python3");
+        ProjectLang::Python if has_python_tests(root) => {
+            // Same interpreter (with pytest) the agent used for its own checks.
+            let mut c = Command::new(sica::tools_python());
             c.args(["-m", "pytest", "-q"]);
             ("pytest", c)
         }
@@ -449,7 +488,7 @@ fn run_live_project_verification(cwd: &str, lang: ProjectLang) -> VerifyReport {
             return VerifyReport {
                 tool: "mpdc-verify".into(),
                 passed: None,
-                lines: vec!["No automatic verification for this project type; rely on SICA's own testing above.".into()],
+                lines: vec!["No automatic verification for this project type; rely on the agent's own testing above.".into()],
             }
         }
     };
@@ -460,13 +499,21 @@ fn run_live_project_verification(cwd: &str, lang: ProjectLang) -> VerifyReport {
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
+            // pytest exit 5 = no tests collected: nothing to judge.
+            if tool == "pytest" && out.status.code() == Some(5) {
+                return VerifyReport {
+                    tool: format!("verify:{tool}"),
+                    passed: None,
+                    lines: vec!["pytest found no tests to run.".into()],
+                };
+            }
             let passed = out.status.success();
             let mut lines = vec![if passed {
                 format!("✓ `{tool}` passed in `{cwd}`.")
             } else {
                 format!("✗ `{tool}` FAILED in `{cwd}` (exit {:?}):", out.status.code())
             }];
-            lines.extend(tail_lines(&combined, if passed { 3 } else { 15 }));
+            lines.extend(tail_lines(&combined, if passed { 3 } else { 25 }));
             VerifyReport { tool: format!("verify:{tool}"), passed: Some(passed), lines }
         }
         Err(e) => VerifyReport {
@@ -698,15 +745,58 @@ impl MpdcCoderApp {
                         }
                     }
                 }
+                let base = gw.trim_end_matches('/').to_string();
+                let (pools, server) = if gw_online {
+                    let pools = ureq::get(&format!("{base}/v1/mpdc/pools"))
+                        .timeout(Duration::from_millis(800))
+                        .call()
+                        .ok()
+                        .and_then(|r| r.into_json::<ModelPoolsPayload>().ok());
+                    let server = ureq::get(&format!("{base}/health"))
+                        .timeout(Duration::from_millis(800))
+                        .call()
+                        .ok()
+                        .and_then(|r| r.into_json::<serde_json::Value>().ok())
+                        .map(|h| {
+                            let f = |k: &str| h[k].as_str().unwrap_or_default().to_string();
+                            (f("engine"), f("base_model"), f("active_model_or_lora"), f("backend_url"))
+                        });
+                    (pools, server)
+                } else {
+                    (None, None)
+                };
                 let _ = tx.send(CoderBgMsg::GpuMetricsUpdated {
                     util_pct,
                     vram_used_mb,
                     vram_total_mb,
                     temp_c,
                     gateway_online: gw_online,
+                    pools,
+                    server,
                 });
             });
         }
+    }
+
+    /// Toggles a pool model locally and on the gateway (so the next poll agrees).
+    fn toggle_pool_model(&mut self, idx: usize) {
+        let pools = &mut self.overview.model_pools;
+        let c_len = pools.coding_models.len();
+        let worker = if idx < c_len {
+            pools.coding_models.get_mut(idx)
+        } else {
+            pools.spatial_visual_models.get_mut(idx - c_len)
+        };
+        let Some(m) = worker else { return };
+        m.active = !m.active;
+        let url = format!(
+            "{}/v1/mpdc/pools/{}/toggle",
+            self.gateway_url.trim_end_matches('/'),
+            m.id
+        );
+        thread::spawn(move || {
+            let _ = ureq::post(&url).timeout(Duration::from_secs(2)).call();
+        });
     }
 
     pub fn active_coding_models(&self) -> Vec<&PoolWorkerItem> {
@@ -770,7 +860,18 @@ impl MpdcCoderApp {
                     vram_total_mb,
                     temp_c,
                     gateway_online,
+                    pools,
+                    server,
                 } => {
+                    if let Some(p) = pools {
+                        self.overview.model_pools = p;
+                    }
+                    if let Some((engine, base_model, active_model, backend_url)) = server {
+                        self.overview.server.engine = engine;
+                        self.overview.server.base_model = base_model;
+                        self.overview.server.active_model = active_model;
+                        self.overview.server.backend_url = backend_url;
+                    }
                     self.overview.gpu.gpu_util_pct = util_pct;
                     self.overview.gpu.vram_used_mb = vram_used_mb;
                     self.overview.gpu.vram_total_mb = vram_total_mb;
@@ -1235,62 +1336,126 @@ impl MpdcCoderApp {
                 });
             }
             let before = sica::snapshot_workspace(&cwd);
-            let mut outcome = None;
-            sica::run_sica(
-                sica::SicaRunRequest {
-                    prompt: task,
-                    cwd: cwd.clone(),
-                    gateway_url: gw_url.clone(),
-                    timeout_s: sica::default_timeout_s(),
-                },
-                |ev| match ev {
-                    sica::SicaEvent::Log(line) => {
-                        let _ = tx.send(CoderBgMsg::AgentLog { line });
-                    }
-                    sica::SicaEvent::Finished(o) => outcome = Some(o),
-                },
-            );
-            let Some(outcome) = outcome else { return };
-
-            let after = sica::snapshot_workspace(&cwd);
-            let changes = sica::diff_snapshots(&before, &after);
-            let verification = if !plan_only && !changes.is_empty() {
-                Some(run_live_project_verification(
-                    &cwd,
-                    detect_project_language(&cwd, &prompt),
-                ))
+            // Verify-and-fix loop: if the independent check fails, the failure is
+            // sent back to the agent (up to MPDC_VERIFY_ROUNDS rounds in total).
+            let max_rounds: u32 = if plan_only {
+                1
             } else {
-                None
+                env::var("MPDC_VERIFY_ROUNDS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(3)
+                    .max(1)
             };
+            let mut round_task = task.clone();
+            let mut first_failed_patch: Option<String> = None;
+            let mut total_duration = 0.0;
+            let mut total_tokens: Option<u64> = None;
+            let mut rounds_run = 0;
+            let mut last: Option<(sica::SicaOutcome, Vec<FileChangeEntry>, Option<VerifyReport>)> = None;
 
-            // Only verified, real patches are harvested as training trajectories.
-            // (Patch Survival Rate should ideally be measured later, at commit time.)
+            for round in 1..=max_rounds {
+                rounds_run = round;
+                if round > 1 {
+                    let _ = tx.send(CoderBgMsg::AgentLog {
+                        line: format!("── fix round {round}/{max_rounds}: the check failed, sending the failure back to the agent ──"),
+                    });
+                }
+                let mut outcome = None;
+                sica::run_sica(
+                    sica::SicaRunRequest {
+                        prompt: round_task.clone(),
+                        cwd: cwd.clone(),
+                        gateway_url: gw_url.clone(),
+                        timeout_s: sica::default_timeout_s(),
+                        read_only: plan_only,
+                    },
+                    |ev| match ev {
+                        sica::SicaEvent::Log(line) => {
+                            let _ = tx.send(CoderBgMsg::AgentLog { line });
+                        }
+                        sica::SicaEvent::Finished(o) => outcome = Some(o),
+                    },
+                );
+                let Some(outcome) = outcome else { return };
+                total_duration += outcome.duration_s;
+                if let Some(t) = outcome.total_tokens {
+                    total_tokens = Some(total_tokens.unwrap_or(0) + t);
+                }
+
+                let after = sica::snapshot_workspace(&cwd);
+                let changes = sica::diff_snapshots(&before, &after);
+                let verification = if !plan_only && !changes.is_empty() {
+                    let _ = tx.send(CoderBgMsg::AgentLog {
+                        line: "── running independent verification ──".into(),
+                    });
+                    let mut v = run_live_project_verification(
+                        &cwd,
+                        detect_project_language(&cwd, &prompt),
+                    );
+                    // Deleting pre-existing tests to get a green run is a failure.
+                    let removed = sica::removed_tests(&before, &after);
+                    if !removed.is_empty() {
+                        v.passed = Some(false);
+                        v.lines.insert(0, format!(
+                            "✗ {} pre-existing test(s) were removed: {}. Restore them (fixing a wrong expectation is fine; deleting tests is not).",
+                            removed.len(),
+                            removed.join(", ")
+                        ));
+                    }
+                    Some(v)
+                } else {
+                    None
+                };
+                let failed = matches!(verification, Some(VerifyReport { passed: Some(false), .. }));
+                if failed && first_failed_patch.is_none() {
+                    first_failed_patch = Some(patch_text(&changes));
+                }
+                let retry = failed && outcome.launch_error.is_none() && round < max_rounds;
+                if retry {
+                    if let Some(v) = &verification {
+                        round_task = build_fix_task(&task, v);
+                    }
+                }
+                last = Some((outcome, changes, verification));
+                if !retry {
+                    break;
+                }
+            }
+            let Some((mut outcome, changes, verification)) = last else { return };
+            outcome.duration_s = total_duration;
+            outcome.total_tokens = total_tokens;
+
+            // Only verified, real patches are harvested. A run that failed first and
+            // was then fixed yields a (rejected, chosen) pair for training.
             if matches!(verification, Some(VerifyReport { passed: Some(true), .. })) {
-                let patch: String = changes
-                    .iter()
-                    .flat_map(|c| c.diff_lines.iter().map(String::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let final_patch = patch_text(&changes);
                 let harvest_url = format!("{}/v1/mpdc/harvest", gw_url.trim_end_matches('/'));
                 let _ = ureq::post(&harvest_url)
                     .timeout(Duration::from_secs(5))
                     .send_json(serde_json::json!({
                         "prompt": prompt,
-                        "agent_initial_code": patch,
-                        "final_committed_code": patch,
-                        "iterations_to_green": 1,
+                        "agent_initial_code": first_failed_patch.clone().unwrap_or_else(|| final_patch.clone()),
+                        "final_committed_code": final_patch,
+                        "iterations_to_green": rounds_run,
                         "domain": "coding",
                         "skills_used": [],
                         "client_node": "mpdc-code",
                     }));
             }
 
+            let verification = verification.map(|mut v| {
+                if rounds_run > 1 {
+                    v.lines.insert(0, format!("(after {rounds_run} agent rounds)"));
+                }
+                (v.tool, v.lines)
+            });
             let _ = tx.send(CoderBgMsg::AgentRunFinished {
                 prompt,
                 plan_only,
                 outcome,
                 changes,
-                verification: verification.map(|v| (v.tool, v.lines)),
+                verification,
             });
         });
     }
@@ -1519,21 +1684,7 @@ impl MpdcCoderApp {
                         }
                         HitAction::TogglePoolModel(idx) => {
                             self.selected_pool_idx = idx;
-                            let c_len = self.overview.model_pools.coding_models.len();
-                            if idx < c_len {
-                                if let Some(m) =
-                                    self.overview.model_pools.coding_models.get_mut(idx)
-                                {
-                                    m.active = !m.active;
-                                }
-                            } else if let Some(m) = self
-                                .overview
-                                .model_pools
-                                .spatial_visual_models
-                                .get_mut(idx - c_len)
-                            {
-                                m.active = !m.active;
-                            }
+                            self.toggle_pool_model(idx);
                         }
                         HitAction::SelectSlashCommand(cmd) => {
                             self.input = cmd;
@@ -1590,24 +1741,7 @@ impl MpdcCoderApp {
                     }
                 }
                 KeyCode::Char(' ') | KeyCode::Enter => {
-                    let c_len = self.overview.model_pools.coding_models.len();
-                    if self.selected_pool_idx < c_len {
-                        if let Some(m) = self
-                            .overview
-                            .model_pools
-                            .coding_models
-                            .get_mut(self.selected_pool_idx)
-                        {
-                            m.active = !m.active;
-                        }
-                    } else if let Some(m) = self
-                        .overview
-                        .model_pools
-                        .spatial_visual_models
-                        .get_mut(self.selected_pool_idx - c_len)
-                    {
-                        m.active = !m.active;
-                    }
+                    self.toggle_pool_model(self.selected_pool_idx);
                 }
                 _ => {}
             }

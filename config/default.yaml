@@ -5,23 +5,26 @@ server:
   data_dir: "./.mpdc_data"
 
 inference:
-  # Pluggable engine: "vllm" (primary, native Safetensors + dynamic PEFT Multi-LoRA),
-  # "sglang", or "llama_cpp"
-  engine: "vllm"
-  backend_url: "http://127.0.0.1:8001/v1"
+  # Default target: a single 6 GB GPU (e.g. RTX 3050 6GB) running Ollama.
+  # Setup once: ./scripts/setup-ollama-model.sh  (creates `mpdc-qwen3-4b`, 32k context)
+  # Other engines: "vllm", "sglang", "llama_cpp" (point backend_url at their /v1).
+  engine: "ollama"
+  backend_url: "http://127.0.0.1:11434/v1"
   api_key: "mpdc-local"
 
-  # Primary model family: Latest Qwen3
-  base_model: "Qwen/Qwen3-8B"
+  # Qwen3-4B-Instruct-2507 (Q4_K_M, ~2.5 GB) wrapped with num_ctx=32768.
+  # SICA's system prompt alone is ~12k tokens, so 32k context is the practical minimum.
+  base_model: "mpdc-qwen3-4b"
   embedding_model: "Qwen/Qwen3-Embedding-0.6B"
 
-  # Qwen3 Hybrid Thinking Mode Routing
-  # Planner & Critic use <think> mode; fast Coder patches can toggle /no_think
+  # Instruct-2507 has no /think switch; directives are stripped by the gateway.
+  # Set true for hybrid Qwen3 models (e.g. Qwen/Qwen3-8B) that support /think and /no_think.
+  thinking_toggle: false
   enable_thinking_for_planner: true
   enable_thinking_for_coder: false
   enable_thinking_for_distiller: true
 
-  # Dynamic Multi-LoRA state
+  # Dynamic Multi-LoRA state (vLLM only)
   active_adapter_name: null
   active_adapter_path: null
 
@@ -52,3 +55,28 @@ evaluation:
   min_replay_pass_rate_delta: 0.0     # Candidate must >= Current on Golden Replay Pass@1
   max_sanity_regression: 0.02         # Candidate cannot drop >2% on core Python/C++/Nix/ROS2 sanity checks
   require_perplexity_improvement: true
+
+# Model pools used by the gateway's /v1/mpdc/swarm endpoint and shown in mpdc-code.
+# On a 6 GB card only one model fits, so every coding role shares it. Ollama can
+# hot-swap a small VLM in (e.g. `ollama pull qwen2.5vl:3b`), but only one model is
+# resident at a time; enable the vision entry only if you accept that swap cost.
+pools:
+  coordination_mode: "specialist_graph"
+  coding_models:
+    - id: "qwen3-4b"
+      name: "mpdc-qwen3-4b"
+      role: "PLANNER_CODER_VERIFIER"
+      category: "coding"
+      endpoint_url: "http://127.0.0.1:11434/v1"
+      thinking: false
+      modalities: ["text"]
+      active: true
+  spatial_visual_models:
+    - id: "qwen25-vl-3b"
+      name: "qwen2.5vl:3b"
+      role: "VLM_2D_VIDEO_CRITIC"
+      category: "vision"
+      endpoint_url: "http://127.0.0.1:11434/v1"
+      thinking: false
+      modalities: ["image"]
+      active: false

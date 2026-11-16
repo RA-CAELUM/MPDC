@@ -8,5 +8,5 @@ set -euo pipefail
 exec nix-shell -p 'python312.withPackages (p: with p; [
     fastapi uvicorn httpx pydantic pydantic-settings pyyaml rich openai
     jsonlines tiktoken python-dotenv tabulate json-repair jinja2 gitpython
-    diff-match-patch anthropic pandas numpy scipy sympy
+    diff-match-patch anthropic pandas numpy scipy sympy pytest
   ])' --run "python3 ${*@Q}"

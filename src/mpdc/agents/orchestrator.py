@@ -109,7 +109,11 @@ class MultiAgentOrchestrator:
         temperature: float = 0.2,
     ) -> str:
         """Calls the upstream vLLM / SGLang Qwen3 endpoint with Qwen3 thinking mode toggle."""
-        mode_prefix = "/think\n" if enable_thinking else "/no_think\n"
+        mode_prefix = (
+            ("/think\n" if enable_thinking else "/no_think\n")
+            if self.config.inference.thinking_toggle
+            else ""
+        )
         url = f"{self.config.inference.backend_url.rstrip('/')}/chat/completions"
         payload: dict[str, Any] = {
             "model": self.active_model_id(),
@@ -315,7 +319,11 @@ class MultiAgentOrchestrator:
         user_prompt: str,
     ) -> SwarmAgentStep:
         """Calls a specific programming or visual/spatial model worker endpoint."""
-        mode_prefix = "/think\n" if worker.thinking else "/no_think\n"
+        mode_prefix = (
+            ("/think\n" if worker.thinking else "/no_think\n")
+            if self.config.inference.thinking_toggle
+            else ""
+        )
         url = f"{worker.endpoint_url.rstrip('/')}/chat/completions"
         payload: dict[str, Any] = {
             "model": worker.name,

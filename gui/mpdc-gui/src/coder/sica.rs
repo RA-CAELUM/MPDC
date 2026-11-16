@@ -32,6 +32,17 @@ pub struct SicaRunRequest {
     pub cwd: String,
     pub gateway_url: String,
     pub timeout_s: u64,
+    /// Plan-only run: the agent gets no file-editing tools.
+    pub read_only: bool,
+}
+
+/// "local" (default): one lean agent with native tool calling, sized for a
+/// single small GPU. "full": SICA's original multi-agent orchestrator.
+pub fn agent_mode() -> String {
+    match env::var("MPDC_SICA_MODE").as_deref() {
+        Ok("full") => "full".into(),
+        _ => "local".into(),
+    }
 }
 
 pub enum SicaEvent {
@@ -55,7 +66,7 @@ pub fn default_timeout_s() -> u64 {
     env::var("MPDC_SICA_TIMEOUT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1800)
+        .unwrap_or(600)
 }
 
 fn is_sica_root(p: &Path) -> bool {
@@ -84,6 +95,15 @@ pub fn locate_sica_root() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Python with SICA's dependencies and pytest; also used for verification so
+/// `mpdc-code` checks with the same tools the agent had.
+pub fn tools_python() -> String {
+    match locate_sica_root() {
+        Some(root) => sica_python(&root),
+        None => env::var("MPDC_SICA_PYTHON").unwrap_or_else(|_| "python3".into()),
+    }
 }
 
 /// Python used to run SICA: `$MPDC_SICA_PYTHON`, the repo's
@@ -157,6 +177,14 @@ pub fn run_sica(req: SicaRunRequest, mut on_event: impl FnMut(SicaEvent)) {
         .env("SICA_HOST_WORKDIR", &req.cwd)
         .env("MPDC_NODE_ID", "mpdc-code")
         .env("PYTHONUNBUFFERED", "1")
+        .env("SICA_AGENT_MODE", agent_mode())
+        .env("SICA_READ_ONLY", if req.read_only { "1" } else { "0" })
+        // Off by default: on a single local GPU the overseer's interleaved calls
+        // evict the agent's prompt cache. Re-enable with MPDC_SICA_OVERSEER=1.
+        .env(
+            "SICA_OVERSEER",
+            if env::var("MPDC_SICA_OVERSEER").map(|v| v == "1").unwrap_or(false) { "1" } else { "0" },
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -356,6 +384,64 @@ fn line_diff<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(char, &'a str)> {
     ops
 }
 
+/// Names of tests that existed before the run but are gone afterwards
+/// (Python `def test_*`, Rust `#[test] fn`). Editing a test is allowed;
+/// deleting one to make the suite pass is not.
+pub fn removed_tests(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> Vec<String> {
+    fn tests_in(path: &str, text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if path.ends_with(".py") {
+            for line in text.lines() {
+                let t = line.trim_start();
+                let t = t.strip_prefix("async ").unwrap_or(t);
+                if let Some(rest) = t.strip_prefix("def test") {
+                    let name: String = format!("test{rest}")
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    out.push(name);
+                }
+            }
+        } else if path.ends_with(".rs") {
+            let mut pending = false;
+            for line in text.lines() {
+                let t = line.trim();
+                if t.starts_with("#[test]") || t.starts_with("#[tokio::test") {
+                    pending = true;
+                } else if pending {
+                    if let Some(idx) = t.find("fn ") {
+                        let name: String = t[idx + 3..]
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect();
+                        out.push(name);
+                        pending = false;
+                    } else if !t.starts_with("#[") && !t.is_empty() {
+                        pending = false;
+                    }
+                }
+            }
+        }
+        out
+    }
+    let after_names: std::collections::BTreeSet<String> = after
+        .iter()
+        .flat_map(|(p, t)| tests_in(p, t))
+        .collect();
+    let mut removed: Vec<String> = before
+        .iter()
+        .flat_map(|(p, t)| tests_in(p, t).into_iter().map(move |n| (p.clone(), n)))
+        .filter(|(_, n)| !after_names.contains(n))
+        .map(|(p, n)| format!("{p}::{n}"))
+        .collect();
+    removed.sort();
+    removed.dedup();
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +478,18 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         assert!(snap.contains_key("src/main.rs"));
         assert!(!snap.keys().any(|k| k.starts_with("target")));
+    }
+
+    #[test]
+    fn detects_removed_but_not_edited_tests() {
+        let mut before = BTreeMap::new();
+        before.insert("tests/test_a.py".to_string(), "def test_keep():\n    assert 1\ndef test_gone():\n    pass\n".to_string());
+        before.insert("src/lib.rs".to_string(), "#[cfg(test)]\nmod t {\n    #[test]\n    fn rust_case() {}\n}\n".to_string());
+        let mut after = before.clone();
+        after.insert("tests/test_a.py".into(), "def test_keep():\n    assert 2  # edited\ndef test_new():\n    pass\n".into());
+        assert_eq!(removed_tests(&before, &after), vec!["tests/test_a.py::test_gone".to_string()]);
+        after.insert("src/lib.rs".into(), "".into());
+        assert_eq!(removed_tests(&before, &after).len(), 2);
     }
 
     #[test]

@@ -17,11 +17,15 @@ class ServerConfig(BaseModel):
 
 
 class InferenceConfig(BaseModel):
-    engine: str = "vllm"  # "vllm", "sglang", or "llama_cpp"
+    engine: str = "vllm"  # "vllm", "sglang", "llama_cpp", or "ollama"
     backend_url: str = "http://127.0.0.1:8001/v1"
     api_key: str = "mpdc-local"
     base_model: str = "Qwen/Qwen3-8B"
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
+    # Whether the served model understands Qwen3's /think and /no_think switches.
+    # Qwen3 *-Instruct-2507 / *-Thinking-2507 models do not: the directives are
+    # stripped instead of being sent as literal text.
+    thinking_toggle: bool = True
     enable_thinking_for_planner: bool = True
     enable_thinking_for_coder: bool = False
     enable_thinking_for_distiller: bool = True
@@ -195,4 +199,6 @@ class MPDCConfig(BaseModel):
             cfg.inference.backend_url = os.environ["MPDC_BACKEND_URL"]
         if os.environ.get("MPDC_BASE_MODEL"):
             cfg.inference.base_model = os.environ["MPDC_BASE_MODEL"]
+        if os.environ.get("MPDC_THINKING_TOGGLE"):
+            cfg.inference.thinking_toggle = os.environ["MPDC_THINKING_TOGGLE"].lower() in ("1", "true", "yes")
         return cfg
