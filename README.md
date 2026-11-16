@@ -2,7 +2,9 @@
   <img src="./assets/mpdc-banner.svg" alt="MPDC - Man Portable Data Center" width="480">
 </div>
 
-I MADE THIS TOOL FOR MYSELF BECAUSE I WANTED TO SAVE MONEY ON CLAUDECODE TOKENS. THE FUTURE OF PROGRAMMING DOES NOT RELY ON BIG TECH DATA CENTERS.
+I just dont want to spend money on claudecode tokens, so I made a local LLM/vLLM that is self improving.
+
+Also known as Meat Proxy Data Center
 
 Multi-Pool **Programming (`Qwen3` / `Qwen3-Coder` / `DeepSeek-R1`) + Visual & Spatial Intelligence (`Qwen2.5-VL` / `SpatialVLM` / `MASt3R-Depth`)** Local LLM Datacenter stack with a native Rust **Claude-Code-style Coding & Planning TUI (`mpdc-code`)**, **`btop`-style Telemetry TUI (`mpdc-tui`)**, and **Desktop Workbench GUI (`mpdc-gui`)**.
 
