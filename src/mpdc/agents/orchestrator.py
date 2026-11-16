@@ -7,6 +7,7 @@ import json
 import subprocess
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -77,9 +78,24 @@ class MultiAgentOrchestrator:
         self.config = config
         self.store = store
 
+    def _adapter_has_weights(self, adapter_path: str) -> bool:
+        path = Path(adapter_path)
+        candidates = [path] if path.is_absolute() else [
+            self.config.data_path.parent / path,
+            Path.cwd() / path,
+        ]
+        return any(
+            (p / name).is_file()
+            for p in candidates
+            for name in ("adapter_model.safetensors", "adapter_model.bin")
+        )
+
     def active_model_id(self) -> str:
+        # Only route to a promoted LoRA when real trained weights exist on disk.
+        # A metadata-only scaffold (dry-run "training") is not servable: vLLM
+        # would 404 on the unknown model name and every call would fail.
         promoted = self.store.get_latest_promoted_adapter()
-        if promoted:
+        if promoted and self._adapter_has_weights(promoted["adapter_path"]):
             return promoted["version"]
         if self.config.inference.active_adapter_name:
             return self.config.inference.active_adapter_name
@@ -318,18 +334,10 @@ class MultiAgentOrchestrator:
                 )
                 resp.raise_for_status()
                 text = resp.json()["choices"][0]["message"]["content"]
-        except Exception:
-            if worker.category in ("vision", "spatial_3d", "geometry"):
-                text = (
-                    f"[{worker.id} ({worker.name}) // {worker.role}]\n"
-                    f"  • Extracted 3D Scene Grounding: target_pose_se3=[0.42, -0.18, 0.31, qw=0.98], "
-                    f"clearance_min=0.045m, visual_critique='End-effector Z-axis inverted relative to grasp normal'"
-                )
-            else:
-                text = (
-                    f"[{worker.id} ({worker.name}) // {worker.role}]\n"
-                    f"  • Applied spatial constraint fix & verified control law for: {user_prompt[:96]}"
-                )
+        except Exception as exc:
+            # Never fabricate model output here: a fake pose/critique gets fed
+            # downstream to the coding models as if it were real grounding.
+            text = f"[MPDC ERROR: {worker.id} ({worker.name}) unreachable at {url}: {exc}]"
         return SwarmAgentStep(
             agent_id=worker.id,
             model_name=worker.name,

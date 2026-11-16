@@ -182,10 +182,53 @@ def test_gateway_skill_injection_and_mcp_server(tmp_path: Path) -> None:
             "messages": [{"role": "user", "content": "How should I set ROS2 QoS sensor reliability?"}],
         },
     )
+    # No upstream model runs in tests: the gateway must fail loudly (502), not fake a reply.
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert "unreachable" in detail["error"]
+    assert detail["skills_injected"] == 1
+
+
+def test_gateway_forwards_openai_fields_to_upstream(tmp_path: Path, monkeypatch) -> None:
+    """SICA relies on `stop` (tool-call stop tokens) and prefill-continuation fields."""
+    import httpx as _httpx
+
+    captured: dict = {}
+
+    async def fake_post(self, url, json=None, headers=None, **kw):  # noqa: A002
+        captured.update(json)
+        return _httpx.Response(
+            200,
+            json={"choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                               "finish_reason": "stop"}],
+                  "usage": {"prompt_tokens": 5, "completion_tokens": 1}},
+            request=_httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(_httpx.AsyncClient, "post", fake_post)
+    client = TestClient(create_gateway_app(_make_test_config(tmp_path)))
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "qwen3",
+            "messages": [
+                {"role": "user", "content": "write a file\n/no_think"},
+                {"role": "assistant", "content": "<TOOL_CALL>..."},
+            ],
+            "stop": ["</TOOL_CALL>", "</AGENT_CALL>"],
+            "top_p": 0.9,
+            "continue_final_message": True,
+            "add_generation_prompt": False,
+        },
+    )
     assert resp.status_code == 200
-    body = resp.json()
-    assert body["mpdc_metadata"]["qwen3_thinking"] is True
-    assert len(body["mpdc_metadata"]["skills_injected"]) == 1
+    assert captured["stop"] == ["</TOOL_CALL>", "</AGENT_CALL>"]
+    assert captured["top_p"] == 0.9
+    assert captured["continue_final_message"] is True
+    assert captured["add_generation_prompt"] is False
+    # Caller's trailing /no_think must not get a conflicting /think prepended.
+    assert captured["messages"][0]["content"] == "write a file\n/no_think"
+    assert "domain" not in captured and "client_node" not in captured
 
 
 def test_multinode_sse_streaming_pause_and_hud_overview(tmp_path: Path) -> None:
@@ -247,7 +290,8 @@ def test_multinode_sse_streaming_pause_and_hud_overview(tmp_path: Path) -> None:
     assert "gpu" in overview
     assert len(overview["nodes"]) == 1
     assert overview["nodes"][0]["node_id"] == "rtx5070-laptop"
-    assert overview["nodes"][0]["completion_tokens"] > 0
+    # No upstream model in tests -> no real completion tokens, but the request is accounted.
+    assert overview["nodes"][0]["prompt_tokens"] > 0
 
 
 def test_sica_local_qwen3_provider_and_think_block_stripping() -> None:
@@ -283,6 +327,36 @@ def test_sica_local_qwen3_provider_and_think_block_stripping() -> None:
 
     provider = LocalOpenAIProvider()
     assert str(provider.client.base_url).rstrip("/").endswith("/v1")
+
+
+def test_sica_tools_remap_sandbox_paths_to_host_workdir(tmp_path: Path, monkeypatch) -> None:
+    """mpdc-code runs SICA on the host: /home/agent/workdir must map to the project dir."""
+    import sys
+
+    sica_root = str(Path(__file__).resolve().parents[1] / "modules" / "MPDC-SICA" / "base_agent")
+    if sica_root not in sys.path:
+        sys.path.insert(0, sica_root)
+    from src.llm.providers.local import prefill_extra_body, resolve_max_tokens
+    from src.tools.execute_command import ExecuteCommand
+
+    monkeypatch.setenv("SICA_HOST_WORKDIR", str(tmp_path))
+    cmd = ExecuteCommand(
+        calling_agent=None,
+        intent="t",
+        command="cd /home/agent/workdir/sub && ls",
+        command_returns=True,
+        generous_expected_duration=5.0,
+    )
+    assert cmd.directory_in_which_to_run_command == str(tmp_path)
+    assert cmd.command == f"cd {tmp_path}/sub && ls"
+
+    monkeypatch.delenv("LOCAL_LLM_MAX_TOKENS", raising=False)
+    assert resolve_max_tokens(None, 32768) == 8192
+    assert prefill_extra_body([{"role": "assistant", "content": "x"}]) == {
+        "continue_final_message": True,
+        "add_generation_prompt": False,
+    }
+    assert prefill_extra_body([{"role": "user", "content": "x"}]) == {}
 
 
 def test_multipool_coding_and_spatial_visual_swarm(tmp_path: Path) -> None:
@@ -328,6 +402,37 @@ def test_multipool_coding_and_spatial_visual_swarm(tmp_path: Path) -> None:
     assert "<mpdc_spatial_scene_graph>" in data["spatial_scene_graph"]
     assert len(data["spatial_steps"]) == 4
     assert len(data["coding_steps"]) == 4
-    assert "target_pose_se3" in data["spatial_scene_graph"]
+    # No model servers run in tests: failures must be surfaced, never fabricated.
+    assert "target_pose_se3" not in data["spatial_scene_graph"]
+    assert all("MPDC ERROR" in s["output"] for s in data["spatial_steps"])
+
+
+def test_unservable_promoted_adapter_is_not_routed(tmp_path: Path) -> None:
+    cfg = _make_test_config(tmp_path)
+    store = MPDCStore(cfg.data_path / "mpdc.sqlite3")
+    store.register_adapter(
+        version="qwen3-lora-v001",
+        base_model=cfg.inference.base_model,
+        adapter_path=str(tmp_path / "missing-adapter"),
+        replay_pass_rate=0.9,
+        holdout_perplexity=1.5,
+        sanity_score=1.0,
+        promoted=True,
+    )
+    orch = MultiAgentOrchestrator(cfg, store)
+    assert orch.active_model_id() == cfg.inference.base_model
+
+    weights_dir = tmp_path / "missing-adapter"
+    weights_dir.mkdir()
+    (weights_dir / "adapter_model.safetensors").write_bytes(b"")
+    assert orch.active_model_id() == "qwen3-lora-v001"
+
+
+def test_training_without_real_metrics_never_promotes(tmp_path: Path) -> None:
+    cfg = _make_test_config(tmp_path)
+    store = MPDCStore(cfg.data_path / "mpdc.sqlite3")
+    report = asyncio.run(OnNodeQLoRATrainer(cfg, store).run_training_cycle(dry_run=True))
+    assert report.evaluation.promoted is False
+    assert store.get_latest_promoted_adapter() is None
 
 

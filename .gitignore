@@ -37,6 +37,8 @@ result-*
 
 # MPDC runtime data (SQLite, harvested datasets, PEFT adapters)
 .mpdc_data/
+.mpdc_session.json
+.mpdc_screenshots/
 
 # Rust / Cargo build artifacts (mpdc-gui)
 gui/mpdc-gui/target/

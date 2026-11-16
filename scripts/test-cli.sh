@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")/.."
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 exec nix-shell -p \
   python312 \
@@ -13,4 +13,4 @@ exec nix-shell -p \
   python312Packages.typer \
   python312Packages.rich \
   python312Packages.numpy \
-  --run "PYTHONPATH=\"src:\$PYTHONPATH\" python3 -m mpdc.cli ${*@Q}"
+  --run "PYTHONPATH=\"$REPO_ROOT/src:\${PYTHONPATH:-}\" python3 -m mpdc.cli ${*@Q}"

@@ -11,7 +11,7 @@ from typing import Any, AsyncGenerator, Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from mpdc.agents.orchestrator import (
     MultiAgentOrchestrator,
@@ -27,11 +27,18 @@ from mpdc.trainer.qlora import OnNodeQLoRATrainer
 
 
 class ChatMessage(BaseModel):
+    # Allow tool_call_id / tool_calls / name etc. so they reach the backend.
+    model_config = ConfigDict(extra="allow")
+
     role: str
-    content: str
+    content: Optional[str] = ""
 
 
 class ChatCompletionRequest(BaseModel):
+    # Unknown OpenAI/vLLM fields (stop, top_p, continue_final_message,
+    # add_generation_prompt, tools, ...) are forwarded upstream untouched.
+    model_config = ConfigDict(extra="allow")
+
     model: str = "qwen3-mpdc"
     messages: list[ChatMessage]
     temperature: float = 0.2
@@ -223,71 +230,94 @@ def create_gateway_app(config: Optional[MPDCConfig] = None) -> FastAPI:
         use_thinking = req.model != "qwen3-mpdc-fast"
         thinking_directive = "/think\n" if use_thinking else "/no_think\n"
 
-        augmented_messages: list[dict[str, str]] = []
+        augmented_messages: list[dict[str, Any]] = []
         injected_system = False
         for msg in req.messages:
+            entry = msg.model_dump(exclude_none=True)
+            entry.setdefault("content", "")
             if msg.role == "system" and not injected_system and skill_block:
-                augmented_messages.append(
-                    {"role": "system", "content": f"{msg.content}\n\n{skill_block}"}
-                )
+                entry["content"] = f"{msg.content or ''}\n\n{skill_block}"
                 injected_system = True
-            else:
-                augmented_messages.append({"role": msg.role, "content": msg.content})
+            augmented_messages.append(entry)
 
         if not injected_system and skill_block:
             augmented_messages.insert(0, {"role": "system", "content": skill_block})
 
         for idx in range(len(augmented_messages) - 1, -1, -1):
             if augmented_messages[idx]["role"] == "user":
-                content = augmented_messages[idx]["content"]
-                if not (content.startswith("/think") or content.startswith("/no_think")):
+                content = augmented_messages[idx]["content"] or ""
+                # Respect a caller's own directive anywhere in the message (SICA
+                # appends "/no_think" at the end); never stack a conflicting one.
+                if "/think" not in content and "/no_think" not in content:
                     augmented_messages[idx]["content"] = f"{thinking_directive}{content}"
                 break
 
         upstream_model = orchestrator.active_model_id()
         upstream_url = f"{cfg.inference.backend_url.rstrip('/')}/chat/completions"
 
-        prompt_tok_est = max(16, sum(len(m["content"].split()) for m in augmented_messages) * 2)
+        prompt_tok_est = max(
+            16, sum(len(str(m.get("content") or "").split()) for m in augmented_messages) * 2
+        )
+        passthrough = {
+            k: v for k, v in (req.model_extra or {}).items() if k not in ("domain", "client_node")
+        }
 
         # Handle Server-Sent Events (SSE) real-time token streaming to remote computers
         if req.stream:
+            stream_payload: dict[str, Any] = {
+                "model": upstream_model,
+                "messages": augmented_messages,
+                "temperature": req.temperature,
+                **passthrough,
+                "stream": True,
+            }
+            if req.max_tokens is not None:
+                stream_payload["max_tokens"] = req.max_tokens
+
             async def sse_token_stream() -> AsyncGenerator[str, None]:
                 cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
                 created = int(time.time())
-                chunks = [
-                    f"[MPDC->{node_id}] ",
-                    f"Routing via {upstream_model} ",
-                    f"({len(skills)} episodic skills injected). ",
-                    "Streaming tokens over LAN/Tailscale...",
-                ]
                 out_tokens = 0
-                for piece in chunks:
-                    out_tokens += max(1, len(piece.split()))
-                    frame = {
+                saw_done = False
+
+                def frame(delta: dict[str, Any], finish: Optional[str]) -> str:
+                    return "data: " + json.dumps({
                         "id": cmpl_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": upstream_model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": piece},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(frame)}\n\n"
-                    await asyncio.sleep(0.01)
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                    }) + "\n\n"
 
-                done_frame = {
-                    "id": cmpl_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": upstream_model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                }
-                yield f"data: {json.dumps(done_frame)}\n\n"
-                yield "data: [DONE]\n\n"
+                try:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
+                        async with client.stream(
+                            "POST",
+                            upstream_url,
+                            json=stream_payload,
+                            headers={"Authorization": f"Bearer {cfg.inference.api_key}"},
+                        ) as upstream:
+                            upstream.raise_for_status()
+                            async for line in upstream.aiter_lines():
+                                if not line.startswith("data:"):
+                                    continue
+                                data = line[5:].strip()
+                                if data == "[DONE]":
+                                    saw_done = True
+                                    yield "data: [DONE]\n\n"
+                                    break
+                                out_tokens += 1
+                                yield f"data: {data}\n\n"
+                except Exception as exc:
+                    # Surface the failure to the client instead of faking tokens.
+                    yield frame(
+                        {"content": f"[MPDC ERROR -> {node_id}] upstream {upstream_url} "
+                                    f"(model={upstream_model}) failed: {exc}"},
+                        None,
+                    )
+                if not saw_done:
+                    yield frame({}, "stop")
+                    yield "data: [DONE]\n\n"
 
                 elapsed = max(0.02, time.time() - t_start)
                 tps = round(out_tokens / elapsed, 1)
@@ -307,44 +337,37 @@ def create_gateway_app(config: Optional[MPDCConfig] = None) -> FastAPI:
             "model": upstream_model,
             "messages": augmented_messages,
             "temperature": req.temperature,
+            **passthrough,
         }
         if req.max_tokens is not None:
             upstream_payload["max_tokens"] = req.max_tokens
 
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
                 resp = await client.post(
                     upstream_url,
                     json=upstream_payload,
                     headers={"Authorization": f"Bearer {cfg.inference.api_key}"},
                 )
-                resp.raise_for_status()
-                completion = resp.json()
-        except Exception:
-            completion = {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": upstream_model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": (
-                                f"[MPDC Gateway -> {upstream_model}] Processed request for node '{node_id}' "
-                                f"with {len(skills)} injected episodic skills."
-                            ),
-                        },
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": prompt_tok_est,
-                    "completion_tokens": 32,
-                    "total_tokens": prompt_tok_est + 32,
+        except Exception as exc:
+            # Agents must see a real failure, not an "assistant" message they will act on.
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": f"upstream {upstream_url} (model={upstream_model}) unreachable: {exc}",
+                    "skills_injected": len(skills),
                 },
-            }
+            )
+        if resp.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": f"upstream {upstream_url} (model={upstream_model}) returned "
+                             f"{resp.status_code}: {resp.text[:2000]}",
+                    "skills_injected": len(skills),
+                },
+            )
+        completion = resp.json()
 
         usage = completion.get("usage") or {}
         p_tok = int(usage.get("prompt_tokens", prompt_tok_est))

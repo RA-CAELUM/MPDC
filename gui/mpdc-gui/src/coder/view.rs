@@ -1,7 +1,7 @@
 //! Rendering for `mpdc-code`: Full intact MPDC SVG banner, clean prompt-first UI, clickable Plans, and live Files Changed + Diff view.
 
 use crate::{
-    coder::{CoderMode, HitAction, HitBox, MpdcCoderApp, TurnBlock, SLASH_COMMANDS},
+    coder::{CoderMode, HitAction, HitBox, MpdcCoderApp, StepState, TurnBlock, SLASH_COMMANDS},
     tui::theme::{
         btop_key_label, btop_meter_spans, sample_grad, BTOP_CPU_BOX, BTOP_DIV_LINE,
         BTOP_GRAPH_TEXT, BTOP_HI_FG, BTOP_MAIN_BG, BTOP_MAIN_FG, BTOP_MEM_BOX, BTOP_NET_BOX,
@@ -118,11 +118,24 @@ impl MpdcCoderApp {
                             .fg(Color::Rgb(11, 13, 20))
                             .add_modifier(Modifier::BOLD),
                     ));
-                    spans.push(Span::raw("  "));
-                    let watch_lbl = if self.screen_watch_enabled {
-                        format!(" ◉ SCREEN WATCH: ON ({} frames) ", self.screen_captures_count)
+                    spans.push(Span::raw(" "));
+                    let (srv_lbl, srv_fg) = if self.gateway_online {
+                        (" ◉ SERVE: ONLINE ", Color::Rgb(56, 189, 248))
                     } else {
-                        " ○ SCREEN WATCH: OFF (/watch | /screen) ".into()
+                        (" ⟳ SERVE: AUTO ", Color::Rgb(167, 139, 250))
+                    };
+                    spans.push(Span::styled(
+                        srv_lbl,
+                        Style::default()
+                            .bg(Color::Rgb(22, 26, 40))
+                            .fg(srv_fg)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::raw(" "));
+                    let watch_lbl = if self.screen_watch_enabled {
+                        format!(" ◉ SCREEN WATCH: ON ({}) ", self.screen_captures_count)
+                    } else {
+                        " ○ SCREEN WATCH: OFF (/watch) ".into()
                     };
                     let watch_bg = if self.screen_watch_enabled {
                         Color::Rgb(56, 189, 248)
@@ -212,7 +225,7 @@ impl MpdcCoderApp {
             header_lines.push(Line::from(spans));
         }
 
-        // Row 7: Subtitle from assets/mpdc-banner.svg + Live Token Telemetry
+        // Row 7: Subtitle from assets/mpdc-banner.svg + Live Token Telemetry & Active Generation Gauge
         let ctx_ratio =
             (self.context_tokens_used as f64 / self.context_tokens_max.max(1) as f64).clamp(0.0, 1.0);
         let mut sub_spans = vec![Span::raw("  ")];
@@ -222,16 +235,34 @@ impl MpdcCoderApp {
         sub_spans.extend(btop_meter_spans(ctx_ratio, 8, GRAD_MPDC));
         sub_spans.push(Span::styled(
             format!(
-                " {}/{} ctx | IN: {} | OUT: {} | KV$: {} | {:.1} tok/s",
+                " {}/{} ctx | IN: {} | OUT: {} | KV$: {} | ",
                 self.context_tokens_used,
                 self.context_tokens_max,
                 self.prompt_tokens_total,
                 self.completion_tokens_total,
                 self.cached_tokens_total,
-                self.last_tok_per_sec
             ),
             Style::default().fg(BTOP_MAIN_FG).add_modifier(Modifier::BOLD),
         ));
+        if self.is_generating {
+            const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let sp = SPINNER[self.spinner_tick % SPINNER.len()];
+            sub_spans.push(Span::styled(
+                format!(
+                    " {sp} GENERATING +{}/{} tok ({:.1} tok/s) ",
+                    self.gen_streamed_tokens, self.gen_target_tokens, self.gen_current_tps
+                ),
+                Style::default()
+                    .bg(Color::Rgb(56, 189, 248))
+                    .fg(Color::Rgb(11, 13, 20))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            sub_spans.push(Span::styled(
+                format!(" ● IDLE (peak {:.1} tok/s) ", self.last_tok_per_sec),
+                Style::default().fg(BTOP_GRAPH_TEXT),
+            ));
+        }
         header_lines.push(Line::from(sub_spans));
 
         // Register clickable hitboxes in header for Mode toggle, Screen Watch toggle (row 0), and Model Pool modal (row 3)
@@ -338,6 +369,34 @@ impl MpdcCoderApp {
                         ]));
                         lines.push(Line::from(""));
                     }
+                    TurnBlock::StepCompleted {
+                        step_id,
+                        total_steps,
+                        title,
+                        file,
+                        agent,
+                    } => {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("  ✓ [Step {step_id}/{total_steps}] "),
+                                Style::default()
+                                    .fg(Color::Rgb(56, 189, 248))
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!("{title} "),
+                                Style::default().fg(BTOP_TITLE).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!("→ wrote {file} "),
+                                Style::default().fg(BTOP_PROC_MISC),
+                            ),
+                            Span::styled(
+                                format!("({agent})"),
+                                Style::default().fg(Color::Rgb(167, 139, 250)),
+                            ),
+                        ]));
+                    }
                     TurnBlock::CodeChangeSummary { summary, files } => {
                         lines.push(Line::from(vec![
                             Span::styled(
@@ -401,6 +460,44 @@ impl MpdcCoderApp {
                     }
                 }
             }
+            if self.is_generating {
+                const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                let sp = SPINNER[self.spinner_tick % SPINNER.len()];
+                let ratio = (self.gen_streamed_tokens as f64
+                    / self.gen_target_tokens.max(1) as f64)
+                    .clamp(0.0, 1.0);
+                let elapsed = self.gen_started_at.elapsed().as_secs_f32();
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {sp} ⚡ Actively Generating Tokens — "),
+                        Style::default()
+                            .fg(Color::Rgb(56, 189, 248))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        self.gen_phase.clone(),
+                        Style::default().fg(BTOP_TITLE).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                let mut bar_line = vec![Span::styled(
+                    "    │ Stream: ",
+                    Style::default().fg(BTOP_MEM_BOX),
+                )];
+                bar_line.extend(btop_meter_spans(ratio, 18, GRAD_MPDC));
+                bar_line.push(Span::styled(
+                    format!(
+                        "  {}/{} tok ({:.0}%) @ {:.1} tok/s | elapsed {:.2}s",
+                        self.gen_streamed_tokens,
+                        self.gen_target_tokens,
+                        ratio * 100.0,
+                        self.gen_current_tps,
+                        elapsed
+                    ),
+                    Style::default().fg(BTOP_MAIN_FG).add_modifier(Modifier::BOLD),
+                ));
+                lines.push(Line::from(bar_line));
+                lines.push(Line::from(""));
+            }
         }
 
         // Calculate wrapped line count so scrolling up and down works accurately
@@ -446,10 +543,27 @@ impl MpdcCoderApp {
     }
 
     fn draw_selectable_plan_box(&mut self, f: &mut Frame, area: Rect) {
+        let any_running = self
+            .active_plans
+            .iter()
+            .any(|p| p.state == StepState::Running);
+        let all_done = !self.active_plans.is_empty()
+            && self
+                .active_plans
+                .iter()
+                .filter(|p| p.selected)
+                .all(|p| p.state == StepState::Done);
+        let title_str = if any_running {
+            "autonomous execution in progress (applying plan steps & writing files)─"
+        } else if all_done {
+            "executed plan (all selected steps applied & written to disk)─"
+        } else {
+            "proposed plan (click steps to select/deselect, click Execute or press Enter/Ctrl+Y)─"
+        };
         let title = Line::from(vec![
             Span::styled("─", Style::default().fg(BTOP_MEM_BOX)),
             Span::styled(
-                "proposed plan (click steps to select/deselect, click Execute to apply code changes)─",
+                title_str,
                 Style::default().fg(BTOP_TITLE).add_modifier(Modifier::BOLD),
             ),
         ]);
@@ -460,22 +574,22 @@ impl MpdcCoderApp {
         let inner_w = area.width.saturating_sub(2);
 
         for (idx, plan) in self.active_plans.iter().enumerate() {
-            let chk = if plan.executed {
-                "[✓ DONE]"
-            } else if plan.selected {
-                "[x]"
-            } else {
-                "[ ]"
-            };
-            let chk_col = if plan.executed || plan.selected {
-                BTOP_PROC_MISC
-            } else {
-                BTOP_GRAPH_TEXT
+            let (chk, chk_col) = match plan.state {
+                StepState::Done => ("[✓ DONE]", BTOP_PROC_MISC),
+                StepState::Running => ("[▶ RUNNING]", BTOP_HI_FG),
+                StepState::Skipped => ("[SKIP]", BTOP_GRAPH_TEXT),
+                StepState::Pending => {
+                    if plan.selected {
+                        ("[x]", BTOP_PROC_MISC)
+                    } else {
+                        ("[ ]", BTOP_GRAPH_TEXT)
+                    }
+                }
             };
 
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!(" {chk} "),
+                    format!(" {chk:<11} "),
                     Style::default().fg(chk_col).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
@@ -499,12 +613,28 @@ impl MpdcCoderApp {
 
         lines.push(Line::from(""));
         let btn_row_y = inner_y + (self.active_plans.len() as u16) + 1;
+        let (btn_lbl, btn_bg) = if any_running {
+            (
+                " [ ⟳ Executing Plan Steps Autonomously & Writing to Disk... ] ",
+                Color::Rgb(244, 114, 182),
+            )
+        } else if all_done {
+            (
+                " [ ✓ Plan Executed & Written to Disk — Inspect Diffs on Right ] ",
+                Color::Rgb(167, 139, 250),
+            )
+        } else {
+            (
+                " [ ▶ Execute Selected Plan & Apply Code Changes (Press Enter, Click, or Ctrl+Y) ] ",
+                Color::Rgb(56, 189, 248),
+            )
+        };
         lines.push(Line::from(vec![
             Span::raw(" "),
             Span::styled(
-                " [ ▶ Execute Selected Plan & Apply Code Changes (Click or press Ctrl+Y) ] ",
+                btn_lbl,
                 Style::default()
-                    .bg(Color::Rgb(56, 189, 248))
+                    .bg(btn_bg)
                     .fg(Color::Rgb(11, 13, 20))
                     .add_modifier(Modifier::BOLD),
             ),
@@ -527,7 +657,7 @@ impl MpdcCoderApp {
 
     fn draw_files_changed_and_diff_pane(&mut self, f: &mut Frame, area: Rect) {
         self.diff_area_rect = area;
-        let files_h = (self.changed_files.len() as u16 + 3).clamp(4, 9);
+        let files_h = (self.changed_files.len() as u16 + 2).clamp(4, 11);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(files_h), Constraint::Min(5)])
@@ -637,6 +767,12 @@ impl MpdcCoderApp {
             }
         }
 
+        let diff_inner_h = chunks[1].height.saturating_sub(2);
+        self.max_diff_scroll = (diff_lines.len() as u16).saturating_sub(diff_inner_h);
+        if self.diff_scroll_offset > self.max_diff_scroll {
+            self.diff_scroll_offset = self.max_diff_scroll;
+        }
+
         let diff_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -689,13 +825,18 @@ impl MpdcCoderApp {
                 ),
             ])
         } else {
+            let chars: Vec<char> = self.input.chars().collect();
+            let pos = self.cursor_pos.min(chars.len());
+            let before: String = chars[..pos].iter().collect();
+            let after: String = chars[pos..].iter().collect();
             Line::from(vec![
                 Span::styled(
                     " ❯ ",
                     Style::default().fg(BTOP_HI_FG).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(self.input.clone(), Style::default().fg(BTOP_TITLE)),
+                Span::styled(before, Style::default().fg(BTOP_TITLE)),
                 Span::styled("█", Style::default().fg(BTOP_PROC_MISC)),
+                Span::styled(after, Style::default().fg(BTOP_TITLE)),
             ])
         };
 
@@ -719,8 +860,7 @@ impl MpdcCoderApp {
             ),
             Span::raw(" "),
         ];
-        spans.extend(btop_key_label("[", "Mouse Click", "] Select Plan/File  "));
-        spans.extend(btop_key_label("[", "Ctrl+Y", "] Execute Plan  "));
+        spans.extend(btop_key_label("[", "Enter/Click", "] Execute Plan  "));
         spans.extend(btop_key_label("[", "Tab", "] Mode  "));
         spans.extend(btop_key_label("[", "Ctrl+P", "] Models  "));
         spans.extend(btop_key_label("[", "↑/↓/Wheel", "] Scroll  "));
@@ -732,9 +872,17 @@ impl MpdcCoderApp {
         );
     }
 
-    fn draw_slash_popup(&self, f: &mut Frame, body_area: Rect) {
-        let popup_h = (SLASH_COMMANDS.len() as u16 + 2).min(body_area.height);
-        let popup_w = 84u16.min(body_area.width.saturating_sub(4));
+    fn draw_slash_popup(&mut self, f: &mut Frame, body_area: Rect) {
+        let filtered: Vec<(&str, &str)> = SLASH_COMMANDS
+            .iter()
+            .copied()
+            .filter(|(cmd, _)| cmd.starts_with(&self.input))
+            .collect();
+        if filtered.is_empty() {
+            return;
+        }
+        let popup_h = (filtered.len() as u16 + 2).min(body_area.height);
+        let popup_w = 88u16.min(body_area.width.saturating_sub(4));
         let rect = Rect::new(
             body_area.x + 2,
             body_area.bottom().saturating_sub(popup_h),
@@ -743,21 +891,29 @@ impl MpdcCoderApp {
         );
         f.render_widget(Clear, rect);
 
-        let lines: Vec<Line> = SLASH_COMMANDS
-            .iter()
-            .filter(|(cmd, _)| cmd.starts_with(&self.input))
-            .map(|(cmd, desc)| {
-                Line::from(vec![
-                    Span::styled(
-                        format!(" {:<10}", cmd),
-                        Style::default()
-                            .fg(BTOP_PROC_MISC)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(*desc, Style::default().fg(BTOP_MAIN_FG)),
-                ])
-            })
-            .collect();
+        let inner_y = rect.y + 1;
+        let inner_x = rect.x + 1;
+        let inner_w = rect.width.saturating_sub(2);
+
+        let mut lines: Vec<Line> = Vec::with_capacity(filtered.len());
+        for (idx, (cmd, desc)) in filtered.into_iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {:<10}", cmd),
+                    Style::default()
+                        .fg(BTOP_PROC_MISC)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(desc, Style::default().fg(BTOP_MAIN_FG)),
+            ]));
+            let row_y = inner_y + idx as u16;
+            if row_y < rect.bottom().saturating_sub(1) {
+                self.hitboxes.push(HitBox {
+                    rect: Rect::new(inner_x, row_y, inner_w, 1),
+                    action: HitAction::SelectSlashCommand(cmd.to_string()),
+                });
+            }
+        }
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -765,13 +921,13 @@ impl MpdcCoderApp {
             .style(Style::default().bg(Color::Rgb(17, 20, 30)))
             .border_style(Style::default().fg(Color::Rgb(167, 139, 250)))
             .title(Span::styled(
-                "─slash commands─",
+                "─slash commands (press Tab or click to autocomplete)─",
                 Style::default().fg(BTOP_TITLE).add_modifier(Modifier::BOLD),
             ));
         f.render_widget(Paragraph::new(lines).block(block), rect);
     }
 
-    fn draw_model_pool_modal(&self, f: &mut Frame, screen: Rect) {
+    fn draw_model_pool_modal(&mut self, f: &mut Frame, screen: Rect) {
         let w = 78u16.min(screen.width.saturating_sub(6));
         let h = 16u16.min(screen.height.saturating_sub(4));
         let rect = Rect::new(
@@ -784,10 +940,14 @@ impl MpdcCoderApp {
 
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
-            " Use ↑/↓ (or j/k) and Space/Enter to toggle models in the swarm (Esc to close):",
+            " Use ↑/↓, Space/Enter, or Mouse Click to toggle models (Esc to close):",
             Style::default().fg(BTOP_GRAPH_TEXT),
         )));
         lines.push(Line::from(""));
+
+        let inner_y = rect.y + 3;
+        let inner_x = rect.x + 1;
+        let inner_w = rect.width.saturating_sub(2);
 
         let c_len = self.overview.model_pools.coding_models.len();
         for (i, m) in self.overview.model_pools.coding_models.iter().enumerate() {
@@ -805,6 +965,13 @@ impl MpdcCoderApp {
                     .fg(BTOP_PROC_MISC)
                     .add_modifier(Modifier::BOLD),
             )]));
+            let row_y = inner_y + i as u16;
+            if row_y < rect.bottom().saturating_sub(1) {
+                self.hitboxes.push(HitBox {
+                    rect: Rect::new(inner_x, row_y, inner_w, 1),
+                    action: HitAction::TogglePoolModel(i),
+                });
+            }
         }
         for (j, m) in self
             .overview
@@ -828,6 +995,13 @@ impl MpdcCoderApp {
                     .fg(BTOP_HI_FG)
                     .add_modifier(Modifier::BOLD),
             )]));
+            let row_y = inner_y + idx as u16;
+            if row_y < rect.bottom().saturating_sub(1) {
+                self.hitboxes.push(HitBox {
+                    rect: Rect::new(inner_x, row_y, inner_w, 1),
+                    action: HitAction::TogglePoolModel(idx),
+                });
+            }
         }
 
         let block = Block::default()

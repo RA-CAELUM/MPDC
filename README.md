@@ -58,15 +58,30 @@ cd ~/your-project
 mpdc-code
 ```
 
+#### How `mpdc-code` works
+Every prompt is executed by the **[MPDC-SICA](modules/MPDC-SICA)** agent: a real LLM tool-calling loop (open/write files, run commands, coder / reasoner / spatial sub-agents, overseer) that talks to your models through `mpdc serve`. `mpdc-code` streams SICA's events into the chat pane, then shows the **actual** file changes it made (before/after snapshot diff) and runs an independent check (`cargo test`, `pytest`, `ctest` or `nix flake check`). Full traces are saved under `~/.cache/mpdc/sica-runs/`.
+
+> SICA edits files and runs shell commands **directly in your project directory** (no sandbox). Use it inside a git repo so you can review and revert.
+
+| Env var | Default | Purpose |
+| :--- | :--- | :--- |
+| `MPDC_GATEWAY_URL` | `http://127.0.0.1:8000` | Gateway that SICA's LLM calls go through |
+| `MPDC_SICA_ROOT` | repo `modules/MPDC-SICA` | SICA checkout to run |
+| `MPDC_SICA_PYTHON` | `scripts/sica-python.sh` (nix-shell) | Python with SICA's dependencies |
+| `MPDC_SICA_TIMEOUT` | `1800` | Seconds before a run is cancelled |
+| `LOCAL_LLM_MAX_TOKENS` | `8192` | Output-token cap per call; keep prompt + this below vLLM `--max-model-len` |
+| `LOCAL_LLM_CONTINUE_PREFILL` | `1` | Send `continue_final_message` (vLLM/SGLang); set `0` for servers that reject it |
+
 #### `mpdc-code` Keyboard Shortcuts & Slash Commands
 | Key / Command | Action |
 | :--- | :--- |
 | **`Tab` / `Shift+Tab`** | Cycle between **`PLAN MODE (/think)`**, **`CODE & DIFF MODE`**, and **`SPATIAL + CODE SWARM`** |
 | **`Ctrl+P`** or `/models` | Open the interactive Model Pool Selector to toggle individual Programming & Spatial/Visual models on/off |
-| **`Ctrl+Y`** or `/apply` | Accept & apply the proposed code diff, run verification, and harvest the trajectory |
-| `/plan <task>` | Architect a step-by-step plan using `qwen3-architect` (`<think>`) + Tier 1 Episodic Skills |
-| `/code <task>` | Synthesize a code patch across active Programming Pool models |
-| `/screen [query]` | Capture a live screenshot of your desktop/sim window and analyze with the Visual/Spatial Pool |
+| **`Ctrl+Y`** or `/apply` / `/execute` | Execute the plan produced by the last `/plan` run |
+| `/plan <task>` | Run SICA read-only: it inspects the project and returns a numbered plan (no file edits) |
+| `/code <task>` | Run SICA autonomously: edit files, build/test, fix, and summarize |
+| `/swarm <task>` | Same as `/code`, but SICA is told to use its `spatial_visual_specialist` sub-agent for 3D/visual reasoning |
+| `/screen [query]` | Capture a screenshot to `.mpdc_captures/` (not analyzed by a model yet: reference the path in a prompt) |
 | `/watch` | Toggle continuous background screen monitoring (`SCREEN WATCH: ON/OFF`) for Spatial AI |
 | `/resume` | Restore the previous session (`.mpdc_session.json`) including chat, plan steps, and diffs |
 | `/export [file.md]` | Export the full session transcript, plan checklist, and unified file diffs to Markdown |

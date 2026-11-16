@@ -130,23 +130,37 @@ class OnNodeQLoRATrainer:
         base_replay = float(current["replay_pass_rate"]) if current else 0.25
         base_ppl = float(current["holdout_perplexity"]) if current else 4.50
 
-        # Scale expected improvement with training trajectory volume when in dry-run/local eval mode
-        gain = min(0.45, 0.04 * max(1, sft_samples + dpo_pairs))
-        cand_replay = (
-            simulated_replay_pass_rate
-            if simulated_replay_pass_rate is not None
-            else round(min(0.98, base_replay + gain), 4)
-        )
-        cand_ppl = (
-            simulated_perplexity
-            if simulated_perplexity is not None
-            else round(max(1.15, base_ppl - gain * 2.5), 4)
-        )
-        cand_sanity = (
-            simulated_sanity_score
-            if simulated_sanity_score is not None
-            else 1.00
-        )
+        # No real SFT/DPO training or replay evaluation is implemented yet, so the
+        # only metrics we can gate on are ones supplied explicitly (tests/manual).
+        # Previously this fabricated a "gain" from the sample count and promoted a
+        # weightless adapter, which then broke model routing for every request.
+        if None in (simulated_replay_pass_rate, simulated_perplexity, simulated_sanity_score):
+            return TrainingRunReport(
+                version=version,
+                adapter_dir=str(adapter_dir),
+                sft_samples=sft_samples,
+                dpo_pairs=dpo_pairs,
+                mode=mode,
+                evaluation=AdapterEvalComparison(
+                    candidate_version=version,
+                    current_version=current["version"] if current else self.config.inference.base_model,
+                    candidate_replay_pass_rate=0.0,
+                    current_replay_pass_rate=base_replay,
+                    candidate_perplexity=0.0,
+                    current_perplexity=base_ppl,
+                    candidate_sanity_score=0.0,
+                    baseline_sanity_score=1.0,
+                    promoted=False,
+                    reason=(
+                        "NOT EVALUATED: QLoRA training and replay evaluation are not implemented; "
+                        "only datasets and an adapter config scaffold were written. Not promoting."
+                    ),
+                ),
+                hot_loaded_into_vllm=False,
+            )
+        cand_replay = simulated_replay_pass_rate
+        cand_ppl = simulated_perplexity
+        cand_sanity = simulated_sanity_score
 
         eval_result = self.quantifier.evaluate_candidate_adapter(
             candidate_version=version,

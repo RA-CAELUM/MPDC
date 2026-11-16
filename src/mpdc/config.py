@@ -166,7 +166,12 @@ class MPDCConfig(BaseModel):
     @property
     def data_path(self) -> Path:
         env_dir = os.environ.get("MPDC_DATA_DIR")
-        path = Path(env_dir) if env_dir else Path(self.server.data_dir)
+        raw_path = Path(env_dir) if env_dir else Path(self.server.data_dir)
+        if not raw_path.is_absolute():
+            repo_root = Path(__file__).resolve().parents[2]
+            path = repo_root / raw_path
+        else:
+            path = raw_path
         path.mkdir(parents=True, exist_ok=True)
         for sub in ("datasets", "adapters", "eval", "logs"):
             (path / sub).mkdir(parents=True, exist_ok=True)
@@ -174,8 +179,12 @@ class MPDCConfig(BaseModel):
 
     @classmethod
     def load(cls, config_path: Optional[str | Path] = None) -> "MPDCConfig":
-        path_str = config_path or os.environ.get("MPDC_CONFIG", "config/default.yaml")
-        path = Path(path_str)
+        repo_root = Path(__file__).resolve().parents[2]
+        path_str = config_path or os.environ.get("MPDC_CONFIG")
+        if path_str:
+            path = Path(path_str)
+        else:
+            path = repo_root / "config" / "default.yaml"
         data = {}
         if path.exists():
             with open(path, "r", encoding="utf-8") as f:

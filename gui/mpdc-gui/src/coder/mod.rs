@@ -1,5 +1,6 @@
-//! Interactive Claude-Code-style Coding & Planning TUI (`mpdc-code`) with Mouse Support, Selectable Plans, and Live Diff View.
+//! Autonomous Claude-Code-style Coding, Planning & Spatial Swarm TUI (`mpdc-code`).
 
+pub mod sica;
 pub mod view;
 
 use crate::models::{OverviewPayload, PoolWorkerItem};
@@ -21,7 +22,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -29,27 +31,39 @@ use std::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoderMode {
-    Plan,
     AutoEdit,
     SpatialSwarm,
+    Plan,
 }
 
 impl CoderMode {
     pub fn next(self) -> Self {
         match self {
-            Self::Plan => Self::AutoEdit,
             Self::AutoEdit => Self::SpatialSwarm,
             Self::SpatialSwarm => Self::Plan,
+            Self::Plan => Self::AutoEdit,
         }
+    }
+
+    pub fn is_autonomous(self) -> bool {
+        matches!(self, Self::AutoEdit | Self::SpatialSwarm)
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Plan => "PLAN MODE (/think)",
-            Self::AutoEdit => "AUTO-EDIT MODE",
-            Self::SpatialSwarm => "SPATIAL + CODE SWARM",
+            Self::AutoEdit => "AUTONOMOUS CODE MODE",
+            Self::SpatialSwarm => "AUTONOMOUS SPATIAL + CODE SWARM",
+            Self::Plan => "MANUAL PLAN MODE (/think)",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StepState {
+    Pending,
+    Running,
+    Done,
+    Skipped,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +74,7 @@ pub struct PlanOption {
     pub target_file: String,
     pub agent: String,
     pub selected: bool,
-    pub executed: bool,
+    pub state: StepState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +98,13 @@ pub enum TurnBlock {
     ProposedPlan {
         prompt: String,
         explanation: String,
+    },
+    StepCompleted {
+        step_id: usize,
+        total_steps: usize,
+        title: String,
+        file: String,
+        agent: String,
     },
     CodeChangeSummary {
         summary: String,
@@ -117,25 +138,38 @@ pub struct SavedCoderSession {
 }
 
 pub enum CoderBgMsg {
-    PlanGenerated {
+    /// One line of the SICA agent's live event stream.
+    AgentLog {
+        line: String,
+    },
+    /// SICA finished; carries the real outcome and on-disk changes.
+    AgentRunFinished {
         prompt: String,
-        thinking_model: String,
-        thinking_summary: String,
-        explanation: String,
-        options: Vec<PlanOption>,
-        auto_execute: bool,
+        plan_only: bool,
+        outcome: sica::SicaOutcome,
+        changes: Vec<FileChangeEntry>,
+        verification: Option<(String, Vec<String>)>,
     },
     ScreenCaptured {
         path: String,
         models: Vec<String>,
         analysis: Vec<String>,
     },
+    GpuMetricsUpdated {
+        util_pct: f64,
+        vram_used_mb: f64,
+        vram_total_mb: f64,
+        temp_c: f64,
+        gateway_online: bool,
+    },
 }
 
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/plan", "Switch to Plan Mode and generate selectable plan steps"),
-    ("/code", "Switch to Auto-Edit Mode and apply code changes with diff"),
-    ("/execute", "Execute the currently selected plan items and show file diffs"),
+    ("/code", "Autonomous Code Mode — plans & executes all multi-file steps automatically"),
+    ("/swarm", "Autonomous Spatial + Code Swarm Mode (3D/Visual + Multi-Module Code)"),
+    ("/plan", "Manual Plan Mode — pause after planning so you can toggle steps"),
+    ("/execute", "Execute remaining selected plan steps autonomously"),
+    ("/cd", "Switch working directory (`/cd /path/to/project`)"),
     ("/screen", "Capture a live screenshot & analyze with Visual/Spatial Models"),
     ("/watch", "Toggle continuous background screen monitoring for Spatial AI"),
     ("/resume", "Resume the last saved session (.mpdc_session.json)"),
@@ -158,6 +192,8 @@ pub enum HitAction {
     SelectChangedFile(usize),
     CycleMode,
     ToggleModelModal,
+    TogglePoolModel(usize),
+    SelectSlashCommand(String),
     ToggleScreenWatch,
     CaptureScreenNow,
 }
@@ -165,23 +201,23 @@ pub enum HitAction {
 pub struct MpdcCoderApp {
     pub cwd: String,
     pub gateway_url: String,
+    pub gateway_online: bool,
     pub mode: CoderMode,
     pub input: String,
     pub cursor_pos: usize,
 
-    // Proper chat scrolling state
     pub scroll_offset: u16,
     pub max_scroll: u16,
     pub scroll_to_bottom: bool,
     pub diff_scroll_offset: u16,
+    pub max_diff_scroll: u16,
 
-    // Interactive Plans & File Changes (populated ONLY after user prompts)
+    pub active_prompt: String,
     pub active_plans: Vec<PlanOption>,
     pub selected_plan_cursor: usize,
     pub changed_files: Vec<FileChangeEntry>,
     pub selected_file_idx: usize,
 
-    // Clickable hitboxes rebuilt each frame
     pub hitboxes: Vec<HitBox>,
     pub chat_area_rect: Rect,
     pub diff_area_rect: Rect,
@@ -204,7 +240,21 @@ pub struct MpdcCoderApp {
     pub should_exit: bool,
     pub screen_watch_enabled: bool,
     pub last_screen_watch: Instant,
+    pub last_gpu_poll: Instant,
     pub screen_captures_count: u32,
+
+    pub is_generating: bool,
+    pub is_executing_plan: bool,
+    pub gen_phase: String,
+    pub gen_streamed_tokens: u32,
+    pub gen_target_tokens: u32,
+    pub gen_current_tps: f64,
+    pub gen_started_at: Instant,
+    pub spinner_tick: usize,
+    /// Plan text produced by a PLAN MODE run, awaiting /execute.
+    pub pending_plan_text: Option<String>,
+    /// Index into `turns` of the live SICA log block for the current run.
+    pub live_log_turn: Option<usize>,
     pub tx: Sender<CoderBgMsg>,
     pub rx: Receiver<CoderBgMsg>,
 }
@@ -215,55 +265,216 @@ impl Default for MpdcCoderApp {
     }
 }
 
-fn discover_workspace_files(cwd: &str) -> Vec<String> {
-    let mut out = Vec::new();
+fn check_or_autostart_gateway(gateway_url: &str) -> bool {
+    let health_url = format!("{}/health", gateway_url.trim_end_matches('/'));
+    if ureq::get(&health_url)
+        .timeout(Duration::from_millis(350))
+        .call()
+        .is_ok()
+    {
+        return true;
+    }
+    // Try auto-starting `mpdc serve` in the MPDC root directory so it never creates `.mpdc_data` in user project dirs
+    let mut cmd = Command::new("mpdc");
+    cmd.arg("serve")
+        .env("MPDC_DATA_DIR", "/home/sgk/Projects/MPDC/.mpdc_data")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if Path::new("/home/sgk/Projects/MPDC").is_dir() {
+        cmd.current_dir("/home/sgk/Projects/MPDC");
+    }
+    let _ = cmd.spawn();
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectLang {
+    Rust,
+    Python,
+    Cpp,
+    Web,
+    Nix,
+}
+
+fn detect_project_language(cwd: &str, prompt: &str) -> ProjectLang {
+    let lower = prompt.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '+')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if words.iter().any(|&w| matches!(w, "rust" | "cargo" | "crate" | "rustc" | "bevy" | "ratatui" | "egui"))
+        || lower.contains(".rs")
+    {
+        return ProjectLang::Rust;
+    }
+    if words.iter().any(|&w| matches!(w, "python" | "py" | "fastapi" | "pytorch" | "pytest" | "flask"))
+        || lower.contains(".py")
+    {
+        return ProjectLang::Python;
+    }
+    if words.iter().any(|&w| matches!(w, "c++" | "cpp" | "cmake" | "cuda" | "opengl"))
+        || lower.contains(".cpp")
+    {
+        return ProjectLang::Cpp;
+    }
+    if words.iter().any(|&w| matches!(w, "html" | "css" | "javascript" | "typescript" | "react" | "threejs" | "webgl" | "website"))
+        || lower.contains(".html")
+        || lower.contains(".js")
+    {
+        return ProjectLang::Web;
+    }
+    if words.iter().any(|&w| matches!(w, "nix" | "nixos" | "flake")) || lower.contains(".nix") {
+        return ProjectLang::Nix;
+    }
+
     let root = Path::new(cwd);
-    if let Ok(entries) = fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
-                continue;
-            }
-            if let Ok(ft) = entry.file_type() {
-                if ft.is_file() {
-                    out.push(name);
-                } else if ft.is_dir() {
-                    if let Ok(sub) = fs::read_dir(entry.path()) {
-                        for sub_e in sub.flatten() {
-                            let sname = sub_e.file_name().to_string_lossy().to_string();
-                            if sname.starts_with('.') {
-                                continue;
-                            }
-                            if let Ok(sft) = sub_e.file_type() {
-                                if sft.is_file() {
-                                    out.push(format!("{name}/{sname}"));
-                                } else if sft.is_dir() {
-                                    if let Ok(sub2) = fs::read_dir(sub_e.path()) {
-                                        for sub2_e in sub2.flatten().take(3) {
-                                            if sub2_e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                                                let s2name = sub2_e.file_name().to_string_lossy().to_string();
-                                                if !s2name.starts_with('.') {
-                                                    out.push(format!("{name}/{sname}/{s2name}"));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if out.len() >= 8 {
-                break;
-            }
+    if root.join("Cargo.toml").exists() {
+        return ProjectLang::Rust;
+    }
+    if root.join("CMakeLists.txt").exists() {
+        return ProjectLang::Cpp;
+    }
+    if root.join("package.json").exists() || root.join("index.html").exists() {
+        return ProjectLang::Web;
+    }
+    if root.join("flake.nix").exists() {
+        return ProjectLang::Nix;
+    }
+    ProjectLang::Python
+}
+
+
+fn wait_for_gateway(gateway_url: &str, max_wait: Duration) -> bool {
+    let started = Instant::now();
+    if check_or_autostart_gateway(gateway_url) {
+        return true;
+    }
+    let health_url = format!("{}/health", gateway_url.trim_end_matches('/'));
+    while started.elapsed() < max_wait {
+        thread::sleep(Duration::from_millis(500));
+        if ureq::get(&health_url)
+            .timeout(Duration::from_millis(500))
+            .call()
+            .is_ok()
+        {
+            return true;
         }
     }
-    if out.is_empty() {
-        out.push("src/main.rs".into());
-        out.push("Cargo.toml".into());
+    false
+}
+
+/// Problem statement handed to SICA for a `mpdc-code` prompt.
+fn build_sica_task(
+    prompt: &str,
+    cwd: &str,
+    mode: CoderMode,
+    plan_only: bool,
+    approved_plan: Option<&str>,
+) -> String {
+    let mut t = format!(
+        "You are working directly on the user's machine in the project directory `{cwd}`. \
+         Use absolute paths inside this directory for every file and command.\n\n"
+    );
+    if plan_only {
+        t.push_str(
+            "PLANNING ONLY: do NOT create, modify or delete any files, and do not run commands \
+             that change state. Inspect the project as needed, then submit (via submit_answer) a \
+             concrete, numbered implementation plan: which files to change, what to change in \
+             each, and the exact commands that will verify the result.\n\n",
+        );
     }
-    out
+    if mode == CoderMode::SpatialSwarm {
+        t.push_str(
+            "This task may involve visual or 3D spatial reasoning: delegate coordinate-frame, \
+             geometry or scene analysis to the spatial_visual_specialist sub-agent where useful.\n\n",
+        );
+    }
+    t.push_str("Task:\n");
+    t.push_str(prompt);
+    if let Some(plan) = approved_plan {
+        t.push_str("\n\nThe user approved the following plan. Implement it:\n");
+        t.push_str(plan);
+    }
+    if !plan_only {
+        t.push_str(
+            "\n\nWhen finished, build the project and run its tests to verify your work, fix any \
+             failures, then submit a short summary of what you changed via submit_answer.",
+        );
+    }
+    t
+}
+
+struct VerifyReport {
+    tool: String,
+    /// None when no automatic check applies to this project type.
+    passed: Option<bool>,
+    lines: Vec<String>,
+}
+
+fn tail_lines(text: &str, n: usize) -> Vec<String> {
+    let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    all[all.len().saturating_sub(n)..]
+        .iter()
+        .map(|s| format!("  {s}"))
+        .collect()
+}
+
+/// Independent post-run check. Reports failures as failures.
+fn run_live_project_verification(cwd: &str, lang: ProjectLang) -> VerifyReport {
+    let root = Path::new(cwd);
+    let (tool, mut cmd) = match lang {
+        ProjectLang::Rust if root.join("Cargo.toml").exists() => {
+            let mut c = Command::new("cargo");
+            c.args(["test", "--quiet"]);
+            ("cargo test", c)
+        }
+        ProjectLang::Python if root.join("tests").is_dir() => {
+            let mut c = Command::new("python3");
+            c.args(["-m", "pytest", "-q"]);
+            ("pytest", c)
+        }
+        ProjectLang::Cpp if root.join("CMakeLists.txt").exists() => {
+            let mut c = Command::new("sh");
+            c.args(["-c", "cmake -S . -B build && cmake --build build && (cd build && ctest --output-on-failure)"]);
+            ("cmake + ctest", c)
+        }
+        ProjectLang::Nix if root.join("flake.nix").exists() => {
+            let mut c = Command::new("nix");
+            c.args(["flake", "check"]);
+            ("nix flake check", c)
+        }
+        _ => {
+            return VerifyReport {
+                tool: "mpdc-verify".into(),
+                passed: None,
+                lines: vec!["No automatic verification for this project type; rely on SICA's own testing above.".into()],
+            }
+        }
+    };
+    match cmd.current_dir(cwd).output() {
+        Ok(out) => {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let passed = out.status.success();
+            let mut lines = vec![if passed {
+                format!("✓ `{tool}` passed in `{cwd}`.")
+            } else {
+                format!("✗ `{tool}` FAILED in `{cwd}` (exit {:?}):", out.status.code())
+            }];
+            lines.extend(tail_lines(&combined, if passed { 3 } else { 15 }));
+            VerifyReport { tool: format!("verify:{tool}"), passed: Some(passed), lines }
+        }
+        Err(e) => VerifyReport {
+            tool: format!("verify:{tool}"),
+            passed: None,
+            lines: vec![format!("Could not run `{tool}`: {e}")],
+        },
+    }
 }
 
 fn read_proc_cpu_times() -> Option<(u64, u64)> {
@@ -319,21 +530,25 @@ impl MpdcCoderApp {
             .unwrap_or_else(|_| ".".into());
         let gateway_url =
             env::var("MPDC_GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".into());
+        let gateway_online = check_or_autostart_gateway(&gateway_url);
 
         let (ram_used_gb, ram_total_gb, ram_pct) = read_proc_ram_gb();
         let prev_cpu_totals = read_proc_cpu_times().unwrap_or((0, 0));
 
-        // Start completely clean: ONLY the prompt, zero fake ROS2 turns or sidebars
+        // Default to AUTONOMOUS CODE MODE (`CoderMode::AutoEdit`) so the agent runs autonomously out of the box!
         let mut app = Self {
             cwd,
             gateway_url,
-            mode: CoderMode::Plan,
+            gateway_online,
+            mode: CoderMode::AutoEdit,
             input: String::new(),
             cursor_pos: 0,
             scroll_offset: 0,
             max_scroll: 0,
             scroll_to_bottom: false,
             diff_scroll_offset: 0,
+            max_diff_scroll: 0,
+            active_prompt: String::new(),
             active_plans: Vec::new(),
             selected_plan_cursor: 0,
             changed_files: Vec::new(),
@@ -350,7 +565,7 @@ impl MpdcCoderApp {
             prompt_tokens_total: 0,
             completion_tokens_total: 0,
             cached_tokens_total: 0,
-            last_tok_per_sec: 72.4,
+            last_tok_per_sec: 74.8,
             cpu_pct: 0.12,
             prev_cpu_totals,
             ram_used_gb,
@@ -359,12 +574,74 @@ impl MpdcCoderApp {
             should_exit: false,
             screen_watch_enabled: false,
             last_screen_watch: Instant::now(),
+            last_gpu_poll: Instant::now() - Duration::from_secs(10),
             screen_captures_count: 0,
+            is_generating: false,
+            is_executing_plan: false,
+            gen_phase: String::new(),
+            gen_streamed_tokens: 0,
+            gen_target_tokens: 0,
+            gen_current_tps: 0.0,
+            gen_started_at: Instant::now(),
+            spinner_tick: 0,
+            pending_plan_text: None,
+            live_log_turn: None,
             tx,
             rx,
         };
         app.refresh_system_metrics();
         app
+    }
+
+    pub fn change_working_directory(&mut self, raw_target: &str) {
+        let trimmed = raw_target.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let expanded = if let Some(rest) = trimmed.strip_prefix("~/") {
+            if let Ok(home) = env::var("HOME") {
+                PathBuf::from(home).join(rest)
+            } else {
+                PathBuf::from(trimmed)
+            }
+        } else {
+            let p = Path::new(trimmed);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                Path::new(&self.cwd).join(p)
+            }
+        };
+
+        if !expanded.exists() {
+            let _ = fs::create_dir_all(&expanded);
+        }
+        match fs::canonicalize(&expanded) {
+            Ok(canon) => {
+                let _ = env::set_current_dir(&canon);
+                self.cwd = canon.display().to_string();
+                self.changed_files.clear();
+                self.active_plans.clear();
+                self.turns.push(TurnBlock::AssistantReply {
+                    model: "mpdc-workdir".into(),
+                    lines: vec![format!(
+                        "Switched WORKDIR to `{}`.",
+                        self.cwd
+                    )],
+                });
+                self.scroll_to_bottom = true;
+            }
+            Err(e) => {
+                self.turns.push(TurnBlock::AssistantReply {
+                    model: "mpdc-workdir".into(),
+                    lines: vec![format!(
+                        "Failed to switch directory to `{}`: {e}",
+                        expanded.display()
+                    )],
+                });
+                self.scroll_to_bottom = true;
+            }
+        }
     }
 
     pub fn refresh_system_metrics(&mut self) {
@@ -382,34 +659,53 @@ impl MpdcCoderApp {
             self.prev_cpu_totals = (tot, idl);
         }
 
-        if let Ok(out) = std::process::Command::new("nvidia-smi")
-            .args([
-                "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
-                "--format=csv,noheader,nounits",
-            ])
-            .output()
-        {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout);
-                if let Some(first_line) = text.lines().next() {
-                    let parts: Vec<&str> = first_line.split(',').map(|s| s.trim()).collect();
-                    if parts.len() >= 4 {
-                        if let (Ok(u), Ok(mu), Ok(mt), Ok(t)) = (
-                            parts[0].parse::<f64>(),
-                            parts[1].parse::<f64>(),
-                            parts[2].parse::<f64>(),
-                            parts[3].parse::<f64>(),
-                        ) {
-                            self.overview.gpu.gpu_util_pct = (u / 100.0).clamp(0.0, 1.0);
-                            self.overview.gpu.vram_used_mb = mu;
-                            self.overview.gpu.vram_total_mb = mt.max(1.0);
-                            self.overview.gpu.vram_pct =
-                                (mu / mt.max(1.0)).clamp(0.0, 1.0);
-                            self.overview.gpu.temp_c = t;
+        if self.last_gpu_poll.elapsed() >= Duration::from_millis(2500) {
+            self.last_gpu_poll = Instant::now();
+            let tx = self.tx.clone();
+            let gw = self.gateway_url.clone();
+            thread::spawn(move || {
+                let gw_online = check_or_autostart_gateway(&gw);
+                let mut util_pct = 0.0;
+                let mut vram_used_mb = 0.0;
+                let mut vram_total_mb = 8192.0;
+                let mut temp_c = 40.0;
+
+                if let Ok(out) = Command::new("nvidia-smi")
+                    .args([
+                        "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+                        "--format=csv,noheader,nounits",
+                    ])
+                    .output()
+                {
+                    if out.status.success() {
+                        let text = String::from_utf8_lossy(&out.stdout);
+                        if let Some(first_line) = text.lines().next() {
+                            let parts: Vec<&str> =
+                                first_line.split(',').map(|s| s.trim()).collect();
+                            if parts.len() >= 4 {
+                                if let (Ok(u), Ok(mu), Ok(mt), Ok(t)) = (
+                                    parts[0].parse::<f64>(),
+                                    parts[1].parse::<f64>(),
+                                    parts[2].parse::<f64>(),
+                                    parts[3].parse::<f64>(),
+                                ) {
+                                    util_pct = (u / 100.0).clamp(0.0, 1.0);
+                                    vram_used_mb = mu;
+                                    vram_total_mb = mt.max(1.0);
+                                    temp_c = t;
+                                }
+                            }
                         }
                     }
                 }
-            }
+                let _ = tx.send(CoderBgMsg::GpuMetricsUpdated {
+                    util_pct,
+                    vram_used_mb,
+                    vram_total_mb,
+                    temp_c,
+                    gateway_online: gw_online,
+                });
+            });
         }
     }
 
@@ -432,38 +728,22 @@ impl MpdcCoderApp {
     }
 
     pub fn poll_bg(&mut self) {
+        if self.is_generating || self.is_executing_plan {
+            self.spinner_tick = self.spinner_tick.wrapping_add(1);
+        }
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                CoderBgMsg::PlanGenerated {
+                CoderBgMsg::AgentLog { line } => {
+                    self.handle_agent_log(line);
+                }
+                CoderBgMsg::AgentRunFinished {
                     prompt,
-                    thinking_model,
-                    thinking_summary,
-                    explanation,
-                    options,
-                    auto_execute,
+                    plan_only,
+                    outcome,
+                    changes,
+                    verification,
                 } => {
-                    self.turns.push(TurnBlock::Thinking {
-                        model: thinking_model,
-                        summary: thinking_summary,
-                    });
-                    self.turns.push(TurnBlock::ProposedPlan {
-                        prompt,
-                        explanation,
-                    });
-                    self.active_plans = options;
-                    self.selected_plan_cursor = 0;
-                    self.prompt_tokens_total += 380;
-                    self.completion_tokens_total += 260;
-                    self.cached_tokens_total += 240;
-                    self.last_tok_per_sec = 74.8;
-                    self.context_tokens_used =
-                        (self.context_tokens_used + 640).min(self.context_tokens_max);
-                    self.scroll_to_bottom = true;
-                    self.save_session();
-
-                    if auto_execute {
-                        self.execute_selected_plans();
-                    }
+                    self.handle_agent_run_finished(prompt, plan_only, outcome, changes, verification);
                 }
                 CoderBgMsg::ScreenCaptured {
                     path,
@@ -483,6 +763,21 @@ impl MpdcCoderApp {
                         (self.context_tokens_used + 420).min(self.context_tokens_max);
                     self.scroll_to_bottom = true;
                     self.save_session();
+                }
+                CoderBgMsg::GpuMetricsUpdated {
+                    util_pct,
+                    vram_used_mb,
+                    vram_total_mb,
+                    temp_c,
+                    gateway_online,
+                } => {
+                    self.overview.gpu.gpu_util_pct = util_pct;
+                    self.overview.gpu.vram_used_mb = vram_used_mb;
+                    self.overview.gpu.vram_total_mb = vram_total_mb;
+                    self.overview.gpu.vram_pct =
+                        (vram_used_mb / vram_total_mb.max(1.0)).clamp(0.0, 1.0);
+                    self.overview.gpu.temp_c = temp_c;
+                    self.gateway_online = gateway_online;
                 }
             }
         }
@@ -522,10 +817,9 @@ impl MpdcCoderApp {
                     self.turns.push(TurnBlock::AssistantReply {
                         model: "mpdc-session".into(),
                         lines: vec![format!(
-                            "Resumed saved session from `{}` ({} turns, {} plan steps, {} changed files).",
+                            "Resumed saved session from `{}` ({} turns, {} changed files).",
                             session_path.display(),
                             self.turns.len(),
-                            self.active_plans.len(),
                             self.changed_files.len()
                         )],
                     });
@@ -562,8 +856,11 @@ impl MpdcCoderApp {
         md.push_str(&format!("# MPDC Session Export (`{}`)\n\n", self.cwd));
         md.push_str(&format!("- **Mode**: `{}`\n", self.mode.label()));
         md.push_str(&format!(
-            "- **Context Tokens**: `{}/{}`\n\n",
-            self.context_tokens_used, self.context_tokens_max
+            "- **Context Tokens**: `{}/{}` (IN: `{}`, OUT: `{}`)\n\n",
+            self.context_tokens_used,
+            self.context_tokens_max,
+            self.prompt_tokens_total,
+            self.completion_tokens_total
         ));
 
         md.push_str("## Conversation & Spatial Transcript\n\n");
@@ -576,7 +873,18 @@ impl MpdcCoderApp {
                     md.push_str(&format!("*Thinking ({model})*: {summary}\n\n"));
                 }
                 TurnBlock::ProposedPlan { explanation, .. } => {
-                    md.push_str(&format!("**Proposed Plan**: {explanation}\n\n"));
+                    md.push_str(&format!("**Plan**: {explanation}\n\n"));
+                }
+                TurnBlock::StepCompleted {
+                    step_id,
+                    total_steps,
+                    title,
+                    file,
+                    agent,
+                } => {
+                    md.push_str(&format!(
+                        "- **[✓ Step {step_id}/{total_steps}]** {title} -> `{file}` (`{agent}`)\n"
+                    ));
                 }
                 TurnBlock::ScreenObservation {
                     screenshot_path,
@@ -595,7 +903,7 @@ impl MpdcCoderApp {
                 }
                 TurnBlock::CodeChangeSummary { summary, files } => {
                     md.push_str(&format!(
-                        "**Code Changes**: {} ({})\n\n",
+                        "\n**Summary**: {} ({})\n\n",
                         summary,
                         files.join(", ")
                     ));
@@ -604,15 +912,6 @@ impl MpdcCoderApp {
                     md.push_str(&format!("### Assistant (`{model}`)\n{}\n\n", lines.join("\n")));
                 }
             }
-        }
-
-        if !self.active_plans.is_empty() {
-            md.push_str("## Active Plan Checklist\n\n");
-            for p in &self.active_plans {
-                let mark = if p.executed || p.selected { "x" } else { " " };
-                md.push_str(&format!("- [{mark}] {}. {} (`{}`)\n", p.id, p.title, p.agent));
-            }
-            md.push('\n');
         }
 
         if !self.changed_files.is_empty() {
@@ -659,40 +958,39 @@ impl MpdcCoderApp {
             .map(|m| m.id.clone())
             .collect();
         let tx = self.tx.clone();
-        let query_label = user_query.unwrap_or_else(|| "Monitor desktop & active simulation/editor windows".into());
+        let query_label =
+            user_query.unwrap_or_else(|| "Monitor desktop & active simulation/editor windows".into());
 
         thread::spawn(move || {
-            // Try KDE spectacle (-b -n -o), grim (Wayland), gnome-screenshot, or scrot
-            let captured_ok = std::process::Command::new("spectacle")
+            let captured_ok = Command::new("spectacle")
                 .args(["-b", "-n", "-o", &img_path_str])
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false)
-                || std::process::Command::new("grim")
+                || Command::new("grim")
                     .arg(&img_path_str)
                     .output()
                     .map(|o| o.status.success())
                     .unwrap_or(false)
-                || std::process::Command::new("scrot")
+                || Command::new("scrot")
                     .arg(&img_path_str)
                     .output()
                     .map(|o| o.status.success())
                     .unwrap_or(false);
 
-            let status_tag = if captured_ok {
-                "Captured live desktop frame via system compositor"
+            // No model is called here yet: report exactly what happened.
+            let analysis = if captured_ok {
+                vec![
+                    format!("Captured screenshot -> `{img_path_str}`"),
+                    format!("Query: {query_label}"),
+                    "Not analyzed: no vision model is wired to /screen yet. Reference this file path in a prompt so the agent can use it.".into(),
+                ]
             } else {
-                "Captured virtual screen buffer"
+                vec![
+                    "✗ Screenshot failed: none of spectacle, grim or scrot succeeded.".into(),
+                    format!("Query: {query_label}"),
+                ]
             };
-
-            let analysis = vec![
-                format!("{status_tag} -> `{img_path_str}`"),
-                format!("Query: {query_label}"),
-                format!(
-                    "Spatial/Visual Grounding ({}) -> Detected active viewport layout, window bounds, and 3D/2D coordinate regions ready for code synthesis.",
-                    s_models.join(" + ")
-                ),
-            ];
             let _ = tx.send(CoderBgMsg::ScreenCaptured {
                 path: img_path_str,
                 models: s_models,
@@ -703,11 +1001,37 @@ impl MpdcCoderApp {
 
     pub fn submit_input(&mut self) {
         let trimmed = self.input.trim().to_string();
+        let has_pending_plan = !self.active_plans.is_empty()
+            && self
+                .active_plans
+                .iter()
+                .any(|p| p.selected && p.state == StepState::Pending);
+
         if trimmed.is_empty() {
+            if has_pending_plan && !self.is_executing_plan {
+                self.start_autonomous_plan_execution();
+            }
             return;
         }
         self.input.clear();
         self.cursor_pos = 0;
+
+        if matches!(
+            trimmed.to_lowercase().as_str(),
+            "y" | "yes" | "run" | "go" | "apply"
+        ) && has_pending_plan
+        {
+            self.start_autonomous_plan_execution();
+            return;
+        }
+
+        if let Some(dir_arg) = trimmed
+            .strip_prefix("/cd ")
+            .or_else(|| trimmed.strip_prefix("cd "))
+        {
+            self.change_working_directory(dir_arg);
+            return;
+        }
 
         if trimmed == "/exit" || trimmed == "/quit" {
             self.save_session();
@@ -758,7 +1082,20 @@ impl MpdcCoderApp {
             return;
         }
         if trimmed == "/execute" || trimmed == "/apply" {
-            self.execute_selected_plans();
+            if has_pending_plan {
+                self.start_autonomous_plan_execution();
+            }
+            return;
+        }
+        if trimmed == "/plan" {
+            self.mode = CoderMode::Plan;
+            self.turns.push(TurnBlock::AssistantReply {
+                model: "mpdc-mode".into(),
+                lines: vec![
+                    "Switched to MANUAL PLAN MODE (/think). Prompts will pause after planning so you can click/toggle steps before execution.".into(),
+                ],
+            });
+            self.scroll_to_bottom = true;
             return;
         }
         if let Some(rest) = trimmed.strip_prefix("/plan ") {
@@ -766,224 +1103,352 @@ impl MpdcCoderApp {
             self.dispatch_user_prompt(rest.trim().to_string(), false);
             return;
         }
+        if trimmed == "/code" || trimmed == "/auto" {
+            self.mode = CoderMode::AutoEdit;
+            if has_pending_plan {
+                self.start_autonomous_plan_execution();
+            } else {
+                self.turns.push(TurnBlock::AssistantReply {
+                    model: "mpdc-mode".into(),
+                    lines: vec![
+                        "Switched to AUTONOMOUS CODE MODE. Prompts will automatically plan, execute all multi-module steps, verify compilation/tests, and write changes to disk.".into(),
+                    ],
+                });
+                self.scroll_to_bottom = true;
+            }
+            return;
+        }
         if let Some(rest) = trimmed.strip_prefix("/code ") {
             self.mode = CoderMode::AutoEdit;
             self.dispatch_user_prompt(rest.trim().to_string(), true);
             return;
         }
+        if trimmed == "/swarm" {
+            self.mode = CoderMode::SpatialSwarm;
+            if has_pending_plan {
+                self.start_autonomous_plan_execution();
+            } else {
+                self.turns.push(TurnBlock::AssistantReply {
+                    model: "mpdc-mode".into(),
+                    lines: vec![
+                        "Switched to AUTONOMOUS SPATIAL + CODE SWARM. Prompts will automatically run 3D/Visual grounding and execute all code steps.".into(),
+                    ],
+                });
+                self.scroll_to_bottom = true;
+            }
+            return;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/swarm ") {
+            self.mode = CoderMode::SpatialSwarm;
+            self.dispatch_user_prompt(rest.trim().to_string(), true);
+            return;
+        }
+        if trimmed.starts_with('/') {
+            let valid: Vec<&str> = SLASH_COMMANDS.iter().map(|(c, _)| *c).collect();
+            self.turns.push(TurnBlock::AssistantReply {
+                model: "mpdc-help".into(),
+                lines: vec![format!(
+                    "Unknown slash command `{}`. Available commands: {}",
+                    trimmed,
+                    valid.join(", ")
+                )],
+            });
+            self.scroll_to_bottom = true;
+            return;
+        }
 
-        let auto_exec = self.mode == CoderMode::AutoEdit;
+        let auto_exec = self.mode.is_autonomous();
         self.dispatch_user_prompt(trimmed, auto_exec);
     }
 
+    /// Every prompt is executed by the MPDC-SICA agent (real LLM tool loop).
+    /// PLAN MODE runs it read-only and keeps the plan for `/execute`.
     fn dispatch_user_prompt(&mut self, prompt: String, auto_execute: bool) {
+        if self.is_generating {
+            self.turns.push(TurnBlock::AssistantReply {
+                model: "mpdc-code".into(),
+                lines: vec!["An agent run is already in progress; wait for it to finish.".into()],
+            });
+            self.scroll_to_bottom = true;
+            return;
+        }
         self.turns.push(TurnBlock::UserPrompt {
             text: prompt.clone(),
             mode: self.mode,
         });
+        self.active_prompt = prompt.clone();
+        self.active_plans.clear();
+        self.pending_plan_text = None;
+        let plan_only = !auto_execute;
+        let task = build_sica_task(&prompt, &self.cwd, self.mode, plan_only, None);
+        self.launch_sica(prompt, task, plan_only);
+    }
+
+    /// Executes the plan produced by the last PLAN MODE run.
+    pub fn start_autonomous_plan_execution(&mut self) {
+        if self.is_generating {
+            return;
+        }
+        let Some(plan) = self.pending_plan_text.take() else {
+            return;
+        };
+        for p in self.active_plans.iter_mut() {
+            p.state = StepState::Running;
+        }
+        self.is_executing_plan = true;
+        let prompt = self.active_prompt.clone();
+        let task = build_sica_task(&prompt, &self.cwd, self.mode, false, Some(&plan));
+        self.launch_sica(prompt, task, false);
+    }
+
+    fn launch_sica(&mut self, prompt: String, task: String, plan_only: bool) {
+        self.is_generating = true;
+        self.gen_started_at = Instant::now();
+        self.gen_phase = if plan_only {
+            "SICA: planning (read-only)".into()
+        } else {
+            "SICA: agent running".into()
+        };
+        self.gen_streamed_tokens = 0;
+        self.gen_target_tokens = 0;
+        self.gen_current_tps = 0.0;
+        self.turns.push(TurnBlock::AssistantReply {
+            model: "sica".into(),
+            lines: vec![format!(
+                "Launching MPDC-SICA agent in `{}` (LLM via {}){}",
+                self.cwd,
+                self.gateway_url,
+                if plan_only { " — PLAN MODE, no file edits" } else { "" }
+            )],
+        });
+        self.live_log_turn = Some(self.turns.len() - 1);
         self.scroll_to_bottom = true;
 
-        let files = discover_workspace_files(&self.cwd);
-        let f0 = files.first().cloned().unwrap_or_else(|| "src/lib.rs".into());
-        let f1 = files.get(1).cloned().unwrap_or_else(|| f0.clone());
-        let f2 = files.get(2).cloned().unwrap_or_else(|| "README.md".into());
-
-        let c_models: Vec<String> = self
-            .active_coding_models()
-            .iter()
-            .map(|m| m.id.clone())
-            .collect();
-        let s_models: Vec<String> = self
-            .active_spatial_models()
-            .iter()
-            .map(|m| m.id.clone())
-            .collect();
-
-        let planner_model = c_models
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "qwen3-architect".into());
-        let coder_model = c_models
-            .get(1)
-            .cloned()
-            .unwrap_or_else(|| planner_model.clone());
-        let verifier_model = c_models
-            .get(2)
-            .cloned()
-            .unwrap_or_else(|| planner_model.clone());
-
-        let url = format!("{}/v1/mpdc/swarm", self.gateway_url.trim_end_matches('/'));
+        let cwd = self.cwd.clone();
+        let gw_url = self.gateway_url.clone();
         let tx = self.tx.clone();
-        let mode = self.mode;
 
         thread::spawn(move || {
-            let mut gateway_note = String::new();
-            let body = serde_json::json!({
-                "prompt": prompt,
-                "domain": "general",
-                "coding_models": c_models,
-                "spatial_models": s_models,
-                "coordination_mode": if mode == CoderMode::SpatialSwarm { "sensor_fusion_loop" } else { "specialist_graph" },
-            });
-            if let Ok(resp) = ureq::post(&url)
-                .timeout(Duration::from_millis(1200))
-                .send_json(body)
-            {
-                if let Ok(val) = resp.into_json::<serde_json::Value>() {
-                    if let Some(patch) = val["synthesized_patch"].as_str() {
-                        gateway_note = patch.lines().next().unwrap_or("").to_string();
+            if !wait_for_gateway(&gw_url, Duration::from_secs(20)) {
+                let _ = tx.send(CoderBgMsg::AgentLog {
+                    line: format!("warning: MPDC gateway {gw_url} is not responding; SICA's LLM calls will fail until `mpdc serve` is up."),
+                });
+            }
+            let before = sica::snapshot_workspace(&cwd);
+            let mut outcome = None;
+            sica::run_sica(
+                sica::SicaRunRequest {
+                    prompt: task,
+                    cwd: cwd.clone(),
+                    gateway_url: gw_url.clone(),
+                    timeout_s: sica::default_timeout_s(),
+                },
+                |ev| match ev {
+                    sica::SicaEvent::Log(line) => {
+                        let _ = tx.send(CoderBgMsg::AgentLog { line });
                     }
-                }
-            }
-
-            let mut options = vec![
-                PlanOption {
-                    id: 1,
-                    title: format!("Inspect & refactor `{f0}` for: {prompt}"),
-                    detail: format!("Analyze module structure and implement core logic in `{f0}`"),
-                    target_file: f0.clone(),
-                    agent: planner_model.clone(),
-                    selected: true,
-                    executed: false,
+                    sica::SicaEvent::Finished(o) => outcome = Some(o),
                 },
-                PlanOption {
-                    id: 2,
-                    title: format!("Update interface & wiring in `{f1}`"),
-                    detail: format!("Propagate types, exports, and error handling in `{f1}`"),
-                    target_file: f1.clone(),
-                    agent: coder_model.clone(),
-                    selected: true,
-                    executed: false,
-                },
-                PlanOption {
-                    id: 3,
-                    title: format!("Add verification tests & update `{f2}`"),
-                    detail: format!("Validate behavior and document changes in `{f2}`"),
-                    target_file: f2.clone(),
-                    agent: verifier_model.clone(),
-                    selected: true,
-                    executed: false,
-                },
-            ];
+            );
+            let Some(outcome) = outcome else { return };
 
-            if mode == CoderMode::SpatialSwarm && !s_models.is_empty() {
-                options.insert(
-                    0,
-                    PlanOption {
-                        id: 0,
-                        title: format!("Run 3D/Visual Scene Grounding ({})", s_models.join(" + ")),
-                        detail: "Extract spatial coordinates, layout bounds, and visual constraints before code synthesis".into(),
-                        target_file: f0,
-                        agent: s_models.join("+"),
-                        selected: true,
-                        executed: false,
-                    },
-                );
-                for (idx, opt) in options.iter_mut().enumerate() {
-                    opt.id = idx + 1;
-                }
-            }
-
-            let explanation = if gateway_note.is_empty() {
-                format!(
-                    "I analyzed your workspace and formulated a {}-step plan for \"{}\". Click any step below to toggle it, then click [▶ Execute Selected Plan] (or press Ctrl+Y) to apply the code changes.",
-                    options.len(),
-                    prompt
-                )
+            let after = sica::snapshot_workspace(&cwd);
+            let changes = sica::diff_snapshots(&before, &after);
+            let verification = if !plan_only && !changes.is_empty() {
+                Some(run_live_project_verification(
+                    &cwd,
+                    detect_project_language(&cwd, &prompt),
+                ))
             } else {
-                format!(
-                    "Formulated a {}-step plan via MPDC Gateway ({}). Click any step below to select/deselect it, then click [▶ Execute Selected Plan] (or press Ctrl+Y).",
-                    options.len(),
-                    gateway_note
-                )
+                None
             };
 
-            let _ = tx.send(CoderBgMsg::PlanGenerated {
+            // Only verified, real patches are harvested as training trajectories.
+            // (Patch Survival Rate should ideally be measured later, at commit time.)
+            if matches!(verification, Some(VerifyReport { passed: Some(true), .. })) {
+                let patch: String = changes
+                    .iter()
+                    .flat_map(|c| c.diff_lines.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let harvest_url = format!("{}/v1/mpdc/harvest", gw_url.trim_end_matches('/'));
+                let _ = ureq::post(&harvest_url)
+                    .timeout(Duration::from_secs(5))
+                    .send_json(serde_json::json!({
+                        "prompt": prompt,
+                        "agent_initial_code": patch,
+                        "final_committed_code": patch,
+                        "iterations_to_green": 1,
+                        "domain": "coding",
+                        "skills_used": [],
+                        "client_node": "mpdc-code",
+                    }));
+            }
+
+            let _ = tx.send(CoderBgMsg::AgentRunFinished {
                 prompt,
-                thinking_model: planner_model,
-                thinking_summary: "Scanned workspace files and decomposed task into selectable implementation steps.".into(),
-                explanation,
-                options,
-                auto_execute,
+                plan_only,
+                outcome,
+                changes,
+                verification: verification.map(|v| (v.tool, v.lines)),
             });
         });
     }
 
-    pub fn execute_selected_plans(&mut self) {
-        let selected: Vec<PlanOption> = self
-            .active_plans
-            .iter()
-            .filter(|p| p.selected)
-            .cloned()
-            .collect();
-        if selected.is_empty() {
-            return;
-        }
-
-        for p in &mut self.active_plans {
-            if p.selected {
-                p.executed = true;
+    fn handle_agent_log(&mut self, line: String) {
+        let short: String = line.chars().take(200).collect();
+        self.gen_phase = format!("SICA: {}", short.chars().take(90).collect::<String>());
+        if let Some(idx) = self.live_log_turn {
+            if let Some(TurnBlock::AssistantReply { lines, .. }) = self.turns.get_mut(idx) {
+                lines.push(short);
+                if lines.len() > 300 {
+                    lines.remove(1);
+                }
             }
         }
+        self.scroll_to_bottom = true;
+    }
 
-        let mut new_changes = Vec::new();
-        let mut modified_paths = Vec::new();
+    fn handle_agent_run_finished(
+        &mut self,
+        prompt: String,
+        plan_only: bool,
+        outcome: sica::SicaOutcome,
+        changes: Vec<FileChangeEntry>,
+        verification: Option<(String, Vec<String>)>,
+    ) {
+        self.is_generating = false;
+        self.is_executing_plan = false;
+        self.live_log_turn = None;
+        self.gen_current_tps = 0.0;
+        self.gen_streamed_tokens = 0;
 
-        for item in &selected {
-            if modified_paths.contains(&item.target_file) {
-                continue;
-            }
-            modified_paths.push(item.target_file.clone());
-
-            // Read real lines from target_file if it exists in cwd to show a realistic contextual diff
-            let full_path = Path::new(&self.cwd).join(&item.target_file);
-            let existing_preview: Vec<String> = fs::read_to_string(&full_path)
-                .ok()
-                .map(|s| s.lines().take(4).map(|l| l.to_string()).collect())
-                .unwrap_or_default();
-
-            let mut diff_lines = vec![
-                format!("--- a/{}", item.target_file),
-                format!("+++ b/{}", item.target_file),
-                "@@ -1,4 +1,9 @@".into(),
-            ];
-            for line in &existing_preview {
-                diff_lines.push(format!(" {line}"));
-            }
-            diff_lines.push(format!("-// TODO: pending implementation ({})", item.agent));
-            diff_lines.push(format!("+// [MPDC {}] {}", item.agent, item.title));
-            diff_lines.push(format!("+// Detail: {}", item.detail));
-            diff_lines.push("+pub fn mpdc_applied_step() -> bool {".into());
-            diff_lines.push("+    true".into());
-            diff_lines.push("+}".into());
-
-            new_changes.push(FileChangeEntry {
-                path: item.target_file.clone(),
-                added: 5,
-                removed: 1,
-                diff_lines,
+        let logdir = outcome.logdir.display().to_string();
+        if let Some(err) = &outcome.launch_error {
+            self.turns.push(TurnBlock::AssistantReply {
+                model: "sica".into(),
+                lines: vec![format!("✗ Could not start SICA: {err}")],
+            });
+        } else if !outcome.success {
+            let mut lines = vec![format!(
+                "✗ SICA exited with code {} after {:.0}s. Last log lines:",
+                outcome
+                    .exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                outcome.duration_s
+            )];
+            lines.extend(outcome.stderr_tail.iter().rev().take(12).rev().cloned());
+            lines.push(format!("Full trace: {logdir}"));
+            self.turns.push(TurnBlock::AssistantReply {
+                model: "sica".into(),
+                lines,
             });
         }
 
-        self.changed_files = new_changes;
-        self.selected_file_idx = 0;
-        self.diff_scroll_offset = 0;
-        self.prompt_tokens_total += 420;
-        self.completion_tokens_total += 310;
-        self.cached_tokens_total += 310;
-        self.context_tokens_used =
-            (self.context_tokens_used + 730).min(self.context_tokens_max);
+        if let Some(answer) = &outcome.answer {
+            self.turns.push(TurnBlock::AssistantReply {
+                model: if plan_only { "sica-plan".into() } else { "sica".into() },
+                lines: answer.lines().map(str::to_string).collect(),
+            });
+        } else if outcome.launch_error.is_none() {
+            let mut lines = vec![format!(
+                "SICA submitted no final answer. Trace: {logdir}/execution_tree.txt"
+            )];
+            // Surface the underlying cause (e.g. connection refused) from the log tail.
+            let all_errs: Vec<&String> = outcome
+                .stderr_tail
+                .iter()
+                .filter(|l| l.contains("ERROR") || l.contains("Error") || l.contains("error"))
+                .collect();
+            let errs: Vec<String> = all_errs[all_errs.len().saturating_sub(4)..]
+                .iter()
+                .map(|l| format!("  {}", l.chars().take(240).collect::<String>()))
+                .collect();
+            if outcome.success && !errs.is_empty() {
+                lines.push("Errors from the agent log:".into());
+                lines.extend(errs);
+            }
+            self.turns.push(TurnBlock::AssistantReply {
+                model: "sica".into(),
+                lines,
+            });
+        }
 
-        self.turns.push(TurnBlock::CodeChangeSummary {
-            summary: format!(
-                "Executed {} selected plan step(s) across {} file(s).",
-                selected.len(),
-                modified_paths.len()
-            ),
-            files: modified_paths,
-        });
+        if plan_only {
+            if let (true, Some(plan)) = (outcome.success, outcome.answer.clone()) {
+                self.pending_plan_text = Some(plan);
+                self.active_plans = vec![PlanOption {
+                    id: 1,
+                    title: "Execute this plan with SICA".into(),
+                    detail: "Press Enter, click Execute, or type /execute".into(),
+                    target_file: String::new(),
+                    agent: "sica".into(),
+                    selected: true,
+                    state: StepState::Pending,
+                }];
+            }
+            if !changes.is_empty() {
+                self.turns.push(TurnBlock::AssistantReply {
+                    model: "mpdc-code".into(),
+                    lines: vec![format!(
+                        "⚠ Plan mode run modified {} file(s) despite read-only instructions — review them.",
+                        changes.len()
+                    )],
+                });
+            }
+        } else {
+            self.active_plans.clear();
+        }
+
+        if !changes.is_empty() {
+            let files: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
+            let (added, removed) = changes
+                .iter()
+                .fold((0, 0), |(a, r), c| (a + c.added, r + c.removed));
+            for fc in changes {
+                if let Some(existing) = self.changed_files.iter_mut().find(|c| c.path == fc.path) {
+                    *existing = fc;
+                } else {
+                    self.changed_files.push(fc);
+                }
+            }
+            self.selected_file_idx = self.changed_files.len().saturating_sub(1);
+            self.turns.push(TurnBlock::CodeChangeSummary {
+                summary: format!(
+                    "SICA changed {} file(s) (+{added} −{removed}) for \"{}\" in {:.0}s{}.",
+                    files.len(),
+                    prompt,
+                    outcome.duration_s,
+                    outcome
+                        .total_tokens
+                        .map(|t| format!(", {t} tokens"))
+                        .unwrap_or_default()
+                ),
+                files,
+            });
+        } else if !plan_only && outcome.launch_error.is_none() {
+            self.turns.push(TurnBlock::AssistantReply {
+                model: "mpdc-code".into(),
+                lines: vec!["No files were changed in the workspace.".into()],
+            });
+        }
+
+        if let Some((tool, lines)) = verification {
+            self.turns.push(TurnBlock::AssistantReply { model: tool, lines });
+        }
+        if let Some(t) = outcome.total_tokens {
+            self.completion_tokens_total += t;
+        }
         self.scroll_to_bottom = true;
         self.save_session();
+    }
+
+    pub fn cycle_mode_and_auto_run(&mut self) {
+        self.mode = self.mode.next();
+        if self.mode.is_autonomous() {
+            self.start_autonomous_plan_execution();
+        }
     }
 
     pub fn scroll_up(&mut self, lines: u16) {
@@ -997,6 +1462,14 @@ impl MpdcCoderApp {
     }
 
     pub fn on_mouse_event(&mut self, mouse: MouseEvent) {
+        // Ignore mouse movement/drag/release events so they never flood the UI loop!
+        match mouse.kind {
+            MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::Down(MouseButton::Left) => {}
+            _ => return,
+        }
+
         let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -1008,7 +1481,8 @@ impl MpdcCoderApp {
             }
             MouseEventKind::ScrollDown => {
                 if self.diff_area_rect.contains(pos) && !self.changed_files.is_empty() {
-                    self.diff_scroll_offset = self.diff_scroll_offset.saturating_add(2);
+                    self.diff_scroll_offset =
+                        (self.diff_scroll_offset + 2).min(self.max_diff_scroll);
                 } else {
                     self.scroll_down(2);
                 }
@@ -1029,7 +1503,7 @@ impl MpdcCoderApp {
                             }
                         }
                         HitAction::ExecuteSelectedPlans => {
-                            self.execute_selected_plans();
+                            self.start_autonomous_plan_execution();
                         }
                         HitAction::SelectChangedFile(idx) => {
                             if idx < self.changed_files.len() {
@@ -1038,16 +1512,40 @@ impl MpdcCoderApp {
                             }
                         }
                         HitAction::CycleMode => {
-                            self.mode = self.mode.next();
+                            self.cycle_mode_and_auto_run();
                         }
                         HitAction::ToggleModelModal => {
                             self.show_model_modal = !self.show_model_modal;
+                        }
+                        HitAction::TogglePoolModel(idx) => {
+                            self.selected_pool_idx = idx;
+                            let c_len = self.overview.model_pools.coding_models.len();
+                            if idx < c_len {
+                                if let Some(m) =
+                                    self.overview.model_pools.coding_models.get_mut(idx)
+                                {
+                                    m.active = !m.active;
+                                }
+                            } else if let Some(m) = self
+                                .overview
+                                .model_pools
+                                .spatial_visual_models
+                                .get_mut(idx - c_len)
+                            {
+                                m.active = !m.active;
+                            }
+                        }
+                        HitAction::SelectSlashCommand(cmd) => {
+                            self.input = cmd;
+                            self.cursor_pos = self.input.chars().count();
                         }
                         HitAction::ToggleScreenWatch => {
                             self.screen_watch_enabled = !self.screen_watch_enabled;
                             self.last_screen_watch = Instant::now();
                             if self.screen_watch_enabled {
-                                self.trigger_screen_capture(Some("Continuous screen watch enabled".into()));
+                                self.trigger_screen_capture(Some(
+                                    "Continuous screen watch enabled".into(),
+                                ));
                             }
                         }
                         HitAction::CaptureScreenNow => {
@@ -1068,8 +1566,8 @@ impl MpdcCoderApp {
                     self.show_model_modal = !self.show_model_modal;
                     return true;
                 }
-                KeyCode::Char('y') => {
-                    self.execute_selected_plans();
+                KeyCode::Char('y') | KeyCode::Char('e') => {
+                    self.start_autonomous_plan_execution();
                     return true;
                 }
                 _ => {}
@@ -1119,7 +1617,17 @@ impl MpdcCoderApp {
         match key.code {
             KeyCode::Esc => return false,
             KeyCode::Tab | KeyCode::BackTab => {
-                self.mode = self.mode.next();
+                if self.input.starts_with('/') && !self.input.contains(' ') {
+                    if let Some((cmd, _)) = SLASH_COMMANDS
+                        .iter()
+                        .find(|(c, _)| c.starts_with(&self.input) && *c != self.input)
+                    {
+                        self.input = (*cmd).to_string();
+                        self.cursor_pos = self.input.chars().count();
+                        return true;
+                    }
+                }
+                self.cycle_mode_and_auto_run();
             }
             KeyCode::Up => {
                 self.scroll_up(2);
@@ -1133,17 +1641,47 @@ impl MpdcCoderApp {
             KeyCode::PageDown => {
                 self.scroll_down(8);
             }
+            KeyCode::Left => {
+                self.cursor_pos = self.cursor_pos.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                let len = self.input.chars().count();
+                if self.cursor_pos < len {
+                    self.cursor_pos += 1;
+                }
+            }
+            KeyCode::Home => {
+                self.cursor_pos = 0;
+            }
+            KeyCode::End => {
+                self.cursor_pos = self.input.chars().count();
+            }
             KeyCode::Enter => {
                 self.submit_input();
             }
             KeyCode::Backspace => {
                 if self.cursor_pos > 0 && !self.input.is_empty() {
-                    self.input.pop();
-                    self.cursor_pos = self.input.len();
+                    let mut chars: Vec<char> = self.input.chars().collect();
+                    if self.cursor_pos <= chars.len() {
+                        chars.remove(self.cursor_pos - 1);
+                        self.input = chars.into_iter().collect();
+                        self.cursor_pos -= 1;
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                let mut chars: Vec<char> = self.input.chars().collect();
+                if self.cursor_pos < chars.len() {
+                    chars.remove(self.cursor_pos);
+                    self.input = chars.into_iter().collect();
                 }
             }
             KeyCode::Char(c) => {
-                // Allow toggling plan items with Alt+1..9
+                if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'u' {
+                    self.input.clear();
+                    self.cursor_pos = 0;
+                    return true;
+                }
                 if key.modifiers.contains(KeyModifiers::ALT) && c.is_ascii_digit() {
                     let idx = (c as usize).saturating_sub('1' as usize);
                     if let Some(p) = self.active_plans.get_mut(idx) {
@@ -1151,8 +1689,11 @@ impl MpdcCoderApp {
                     }
                     return true;
                 }
-                self.input.push(c);
-                self.cursor_pos = self.input.len();
+                let mut chars: Vec<char> = self.input.chars().collect();
+                let pos = self.cursor_pos.min(chars.len());
+                chars.insert(pos, c);
+                self.input = chars.into_iter().collect();
+                self.cursor_pos = pos + 1;
             }
             _ => {}
         }
@@ -1160,15 +1701,67 @@ impl MpdcCoderApp {
     }
 }
 
-pub fn render_coder_once_snapshot(width: u16, height: u16, initial_prompt: Option<String>) -> io::Result<()> {
+fn parse_cli_dir_and_prompt(args: Vec<String>) -> (Option<String>, Option<String>) {
+    let mut target_dir: Option<String> = None;
+    let mut prompt_words: Vec<String> = Vec::new();
+    let mut iter = args.into_iter().skip(1);
+
+    while let Some(arg) = iter.next() {
+        if arg == "--once" {
+            continue;
+        }
+        if arg == "--cwd" || arg == "-C" {
+            if let Some(d) = iter.next() {
+                target_dir = Some(d);
+            }
+            continue;
+        }
+        if let Some(d) = arg.strip_prefix("--cwd=") {
+            target_dir = Some(d.to_string());
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        if target_dir.is_none() && prompt_words.is_empty() && Path::new(&arg).is_dir() {
+            target_dir = Some(arg);
+            continue;
+        }
+        prompt_words.push(arg);
+    }
+
+    let prompt = if prompt_words.is_empty() {
+        None
+    } else {
+        Some(prompt_words.join(" "))
+    };
+    (target_dir, prompt)
+}
+
+pub fn render_coder_once_snapshot(
+    width: u16,
+    height: u16,
+    target_dir: Option<String>,
+    initial_prompt: Option<String>,
+) -> io::Result<()> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend)?;
     let mut app = MpdcCoderApp::new();
+    if let Some(d) = target_dir {
+        app.change_working_directory(&d);
+    }
     if let Some(p) = initial_prompt {
         app.input = p;
         app.submit_input();
-        thread::sleep(Duration::from_millis(120));
-        app.poll_bg();
+        // Wait for the agent run to finish (bounded by the SICA timeout).
+        let deadline = Instant::now() + Duration::from_secs(sica::default_timeout_s() + 120);
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+            app.poll_bg();
+            if !app.is_generating && !app.is_executing_plan {
+                break;
+            }
+        }
     }
     terminal.draw(|f| app.draw(f))?;
 
@@ -1205,7 +1798,10 @@ pub fn render_coder_once_snapshot(width: u16, height: u16, initial_prompt: Optio
 
 pub fn run_coder_tui_entry() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.iter().any(|a| a == "--once") {
+    let is_once = args.iter().any(|a| a == "--once");
+    let (target_dir, init_prompt) = parse_cli_dir_and_prompt(args);
+
+    if is_once {
         let cols = env::var("COLUMNS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1213,18 +1809,8 @@ pub fn run_coder_tui_entry() -> io::Result<()> {
         let lines = env::var("LINES")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(32);
-        let prompt_args: Vec<String> = args
-            .into_iter()
-            .skip(1)
-            .filter(|a| !a.starts_with('-'))
-            .collect();
-        let init_p = if prompt_args.is_empty() {
-            None
-        } else {
-            Some(prompt_args.join(" "))
-        };
-        return render_coder_once_snapshot(cols, lines, init_p);
+            .unwrap_or(34);
+        return render_coder_once_snapshot(cols, lines, target_dir, init_prompt);
     }
 
     enable_raw_mode()?;
@@ -1234,13 +1820,11 @@ pub fn run_coder_tui_entry() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = MpdcCoderApp::new();
-    let prompt_args: Vec<String> = args
-        .into_iter()
-        .skip(1)
-        .filter(|a| !a.starts_with('-'))
-        .collect();
-    if !prompt_args.is_empty() {
-        app.input = prompt_args.join(" ");
+    if let Some(d) = target_dir {
+        app.change_working_directory(&d);
+    }
+    if let Some(p) = init_prompt {
+        app.input = p;
         app.submit_input();
     }
 
@@ -1265,20 +1849,28 @@ fn run_coder_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut MpdcCoderApp
         }
         terminal.draw(|f| app.draw(f))?;
 
-        if event::poll(Duration::from_millis(50))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if !app.on_key_event(key) || app.should_exit {
-                        app.save_session();
-                        return Ok(());
+        // Wait up to 40ms for the first event, then drain ALL queued events immediately
+        // so mouse-move events NEVER back up the keyboard queue!
+        if event::poll(Duration::from_millis(40))? {
+            loop {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if !app.on_key_event(key) || app.should_exit {
+                            app.save_session();
+                            return Ok(());
+                        }
                     }
+                    Event::Mouse(mouse) => {
+                        app.on_mouse_event(mouse);
+                    }
+                    _ => {}
                 }
-                Event::Mouse(mouse) => {
-                    app.on_mouse_event(mouse);
+                if !event::poll(Duration::ZERO)? {
+                    break;
                 }
-                _ => {}
             }
         }
+
         if last_tick.elapsed() >= Duration::from_millis(500) {
             app.refresh_system_metrics();
             last_tick = Instant::now();
