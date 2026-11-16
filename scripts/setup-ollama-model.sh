@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # One-time setup of MPDC's default local model for 6 GB GPUs.
-# Pulls Qwen3-4B-Instruct-2507 (Q4_K_M) and creates `mpdc-qwen3-4b` with a 32k context.
+# Pulls Qwen3-4B-Instruct-2507 (Q4_K_M) and creates `mpdc-qwen3-4b` (16k context per slot).
 #
-# For 32k context to fit in 6 GB VRAM, run the Ollama server with:
-#   OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 OLLAMA_NUM_PARALLEL=1 OLLAMA_MAX_LOADED_MODELS=1
+# Run the Ollama server with two parallel slots (coder + independent tester), which
+# together fit in ~5.2 GB VRAM:
+#   OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 OLLAMA_NUM_PARALLEL=2 OLLAMA_MAX_LOADED_MODELS=1
 # (on NixOS: services.ollama.environmentVariables, see README).
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"

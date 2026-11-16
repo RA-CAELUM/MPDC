@@ -413,13 +413,22 @@ fn build_sica_task(
 
 /// Follow-up task after the independent check failed.
 fn build_fix_task(original_task: &str, v: &VerifyReport) -> String {
-    format!(
+    let mut t = format!(
         "{original_task}\n\nA previous attempt already changed the project, but an independent \
          check (`{}`) FAILED:\n{}\n\nFind the cause and fix it: fix the code, or fix a test whose \
          expectation contradicts the task description. Then run the check again and finish.",
         v.tool.trim_start_matches("verify:"),
         v.lines.join("\n")
-    )
+    );
+    if let Some(src) = &v.acceptance_source {
+        t.push_str(&format!(
+            "\n\nThe acceptance tests were written by a separate tester from the task description \
+             alone; you cannot edit them and they are not in the project. Here they are:\n```python\n{src}\n```\n\
+             Make the code satisfy every acceptance test that agrees with the task. If one contradicts \
+             the task description, do not bend the code to it: say which one and why in your finish summary."
+        ));
+    }
+    t
 }
 
 fn patch_text(changes: &[FileChangeEntry]) -> String {
@@ -435,6 +444,8 @@ struct VerifyReport {
     /// None when no automatic check applies to this project type.
     passed: Option<bool>,
     lines: Vec<String>,
+    /// Source of the independent acceptance tests, when they failed (for the fix round).
+    acceptance_source: Option<String>,
 }
 
 fn tail_lines(text: &str, n: usize) -> Vec<String> {
@@ -488,6 +499,7 @@ fn run_live_project_verification(cwd: &str, lang: ProjectLang) -> VerifyReport {
             return VerifyReport {
                 tool: "mpdc-verify".into(),
                 passed: None,
+                acceptance_source: None,
                 lines: vec!["No automatic verification for this project type; rely on the agent's own testing above.".into()],
             }
         }
@@ -504,6 +516,7 @@ fn run_live_project_verification(cwd: &str, lang: ProjectLang) -> VerifyReport {
                 return VerifyReport {
                     tool: format!("verify:{tool}"),
                     passed: None,
+                    acceptance_source: None,
                     lines: vec!["pytest found no tests to run.".into()],
                 };
             }
@@ -514,13 +527,88 @@ fn run_live_project_verification(cwd: &str, lang: ProjectLang) -> VerifyReport {
                 format!("✗ `{tool}` FAILED in `{cwd}` (exit {:?}):", out.status.code())
             }];
             lines.extend(tail_lines(&combined, if passed { 3 } else { 25 }));
-            VerifyReport { tool: format!("verify:{tool}"), passed: Some(passed), lines }
+            VerifyReport { tool: format!("verify:{tool}"), passed: Some(passed), lines, acceptance_source: None }
         }
         Err(e) => VerifyReport {
             tool: format!("verify:{tool}"),
             passed: None,
+            acceptance_source: None,
             lines: vec![format!("Could not run `{tool}`: {e}")],
         },
+    }
+}
+
+/// Task for the independent tester that runs in the second Ollama slot.
+fn build_tester_task(prompt: &str, cwd: &str) -> String {
+    format!(
+        "Project directory (read it with absolute paths; you cannot change it): `{cwd}`\n\n\
+         Another engineer is implementing this task right now:\n<task>\n{prompt}\n</task>\n\n\
+         Write independent acceptance tests for it as test_acceptance.py in your current directory."
+    )
+}
+
+/// Runs the tester's acceptance tests against the project and folds the result
+/// into the verification report. Collection/import errors (e.g. the tester
+/// guessed a different module name) are reported as inconclusive, not failures.
+/// After one fix round has already been spent on them (`advisory`), failing
+/// acceptance tests no longer fail the run: a small tester model can assume
+/// requirements the task never stated, and the project's own checks stay
+/// authoritative.
+fn apply_acceptance(v: &mut VerifyReport, cwd: &str, acc_dir: &Path, advisory: bool) {
+    let file = acc_dir.join("test_acceptance.py");
+    let Ok(src) = fs::read_to_string(&file) else {
+        v.lines.push("(independent tester produced no acceptance tests)".into());
+        return;
+    };
+    let pythonpath = match env::var("PYTHONPATH") {
+        Ok(p) if !p.is_empty() => format!("{cwd}:{p}"),
+        _ => cwd.to_string(),
+    };
+    let out = Command::new(sica::tools_python())
+        .args(["-m", "pytest", "-q", "-p", "no:cacheprovider"])
+        .arg(&file)
+        .current_dir(cwd)
+        .env("PYTHONPATH", pythonpath)
+        .output();
+    match out {
+        Ok(o) => {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            match o.status.code() {
+                Some(0) => {
+                    v.lines.push("✓ independent acceptance tests passed.".into());
+                    if v.passed.is_none() {
+                        v.passed = Some(true);
+                    }
+                }
+                Some(1) if advisory => {
+                    v.lines.push(
+                        "⚠ independent acceptance tests still fail after a fix round; treated as advisory (the tester may have assumed requirements the task does not state):"
+                            .into(),
+                    );
+                    v.lines.extend(tail_lines(&combined, 8));
+                }
+                Some(1) => {
+                    v.passed = Some(false);
+                    v.lines.push(
+                        "✗ independent acceptance tests FAILED (written from the task description only; they may themselves be wrong):"
+                            .into(),
+                    );
+                    v.lines.extend(tail_lines(&combined, 20));
+                    v.acceptance_source = Some(src.chars().take(4000).collect());
+                }
+                code => {
+                    v.lines.push(format!(
+                        "⚠ acceptance tests inconclusive (pytest exit {code:?}, e.g. the tester guessed a different import):"
+                    ));
+                    v.lines.extend(tail_lines(&combined, 4));
+                }
+            }
+        }
+        Err(e) => v.lines.push(format!("Could not run acceptance tests: {e}")),
     }
 }
 
@@ -1354,6 +1442,42 @@ impl MpdcCoderApp {
             let mut rounds_run = 0;
             let mut last: Option<(sica::SicaOutcome, Vec<FileChangeEntry>, Option<VerifyReport>)> = None;
 
+            // Independent tester in the second Ollama slot (Python projects): writes
+            // acceptance tests from the task description while the coder works.
+            let lang = detect_project_language(&cwd, &prompt);
+            let use_tester = !plan_only
+                && lang == ProjectLang::Python
+                && env::var("MPDC_TESTER").map(|v| v != "0").unwrap_or(true);
+            let acc_dir = sica::acceptance_dir();
+            let mut acceptance_feedback_used = false;
+            let mut tester = if use_tester {
+                let _ = fs::create_dir_all(&acc_dir);
+                let _ = tx.send(CoderBgMsg::AgentLog {
+                    line: "── independent tester started in parallel (acceptance tests from the task only) ──".into(),
+                });
+                let (ttx, tgw, tcwd, tacc, tprompt) =
+                    (tx.clone(), gw_url.clone(), cwd.clone(), acc_dir.clone(), prompt.clone());
+                Some(thread::spawn(move || {
+                    sica::run_sica(
+                        sica::SicaRunRequest {
+                            prompt: build_tester_task(&tprompt, &tcwd),
+                            cwd: tacc.display().to_string(),
+                            gateway_url: tgw,
+                            timeout_s: 300,
+                            read_only: false,
+                            extra_env: vec![("SICA_ROLE".into(), "tester".into())],
+                        },
+                        |ev| {
+                            if let sica::SicaEvent::Log(line) = ev {
+                                let _ = ttx.send(CoderBgMsg::AgentLog { line: format!("[tester] {line}") });
+                            }
+                        },
+                    );
+                }))
+            } else {
+                None
+            };
+
             for round in 1..=max_rounds {
                 rounds_run = round;
                 if round > 1 {
@@ -1369,6 +1493,7 @@ impl MpdcCoderApp {
                         gateway_url: gw_url.clone(),
                         timeout_s: sica::default_timeout_s(),
                         read_only: plan_only,
+                        extra_env: Vec::new(),
                     },
                     |ev| match ev {
                         sica::SicaEvent::Log(line) => {
@@ -1383,16 +1508,25 @@ impl MpdcCoderApp {
                     total_tokens = Some(total_tokens.unwrap_or(0) + t);
                 }
 
+                if let Some(handle) = tester.take() {
+                    let _ = tx.send(CoderBgMsg::AgentLog {
+                        line: "── waiting for the independent tester to finish ──".into(),
+                    });
+                    let _ = handle.join();
+                }
                 let after = sica::snapshot_workspace(&cwd);
                 let changes = sica::diff_snapshots(&before, &after);
                 let verification = if !plan_only && !changes.is_empty() {
                     let _ = tx.send(CoderBgMsg::AgentLog {
                         line: "── running independent verification ──".into(),
                     });
-                    let mut v = run_live_project_verification(
-                        &cwd,
-                        detect_project_language(&cwd, &prompt),
-                    );
+                    let mut v = run_live_project_verification(&cwd, lang);
+                    if use_tester {
+                        apply_acceptance(&mut v, &cwd, &acc_dir, acceptance_feedback_used);
+                        if v.acceptance_source.is_some() {
+                            acceptance_feedback_used = true;
+                        }
+                    }
                     // Deleting pre-existing tests to get a green run is a failure.
                     let removed = sica::removed_tests(&before, &after);
                     if !removed.is_empty() {

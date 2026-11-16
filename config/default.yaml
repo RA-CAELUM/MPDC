@@ -12,8 +12,8 @@ inference:
   backend_url: "http://127.0.0.1:11434/v1"
   api_key: "mpdc-local"
 
-  # Qwen3-4B-Instruct-2507 (Q4_K_M, ~2.5 GB) wrapped with num_ctx=32768.
-  # SICA's system prompt alone is ~12k tokens, so 32k context is the practical minimum.
+  # Qwen3-4B-Instruct-2507 (Q4_K_M, ~2.5 GB) wrapped with num_ctx=16384 per slot;
+  # Ollama runs 2 slots (OLLAMA_NUM_PARALLEL=2): mpdc-code's coder + independent tester.
   base_model: "mpdc-qwen3-4b"
   embedding_model: "Qwen/Qwen3-Embedding-0.6B"
 

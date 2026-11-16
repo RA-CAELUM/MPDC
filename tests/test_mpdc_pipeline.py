@@ -475,6 +475,10 @@ def test_local_tools_edit_run_and_stay_inside_workdir(tmp_path: Path) -> None:
     missing = run(ReplaceInFile(calling_agent=agent, path="pkg/a.py", old_text="nope", new_text="z"))
     assert not missing.success and "not found" in missing.errors
 
+    # Models often prefix paths with the project folder's own name.
+    assert run(WriteFile(calling_agent=agent, path=f"{tmp_path.name}/b.py", content="z = 0")).success
+    assert (tmp_path / "b.py").exists() and not (tmp_path / tmp_path.name).exists()
+
     read = run(ReadFile(calling_agent=agent, path="pkg/a.py"))
     assert "    2| y = 3" in read.output
 
@@ -490,7 +494,7 @@ def test_fit_to_context_trims_old_tool_output_and_keeps_pairs(monkeypatch) -> No
     _sica_path()
     from src.llm.providers.local import _estimate_tokens, fit_to_context
 
-    monkeypatch.setenv("LOCAL_LLM_CONTEXT_TOKENS", "16384")
+    monkeypatch.delenv("LOCAL_LLM_CONTEXT_TOKENS", raising=False)  # default: 16k per slot
     monkeypatch.setenv("LOCAL_LLM_MAX_TOKENS", "4096")
     msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "task"}]
     for i in range(40):
@@ -556,6 +560,23 @@ def test_local_coder_text_reply_ends_run_only_after_real_edits(tmp_path: Path, m
     assert asyncio.run(agent.accept_text_reply_as_final(summary)) is False  # first: reminder
     assert asyncio.run(agent.accept_text_reply_as_final(summary)) is True   # second: accepted
     assert (tmp_path / "logs" / "answer.txt").read_text() == "Fixed median; tests pass."
+
+
+def test_acceptance_tester_agent_cannot_edit_the_project(tmp_path: Path, monkeypatch) -> None:
+    _sica_path()
+    acc = tmp_path / "acc"
+    acc.mkdir()
+    monkeypatch.setenv("SICA_HOST_WORKDIR", str(acc))
+    from src.agents.implementations.local_coder import AcceptanceTesterAgent
+    from src.tools.local_tools import WriteFile
+
+    agent = AcceptanceTesterAgent(workdir=acc, logdir=tmp_path / "logs")
+    names = {t.TOOL_NAME for t in agent._available_tools}
+    assert "replace_in_file" not in names and {"read_file", "write_file", "finish"} <= names
+    assert "test_acceptance.py" in agent.SYSTEM_PROMPT
+    project_file = tmp_path / "project.py"
+    res = asyncio.run(WriteFile(calling_agent=agent, path=str(project_file), content="x").run())
+    assert not res.success and not project_file.exists()  # writes confined to its own dir
 
 
 def test_multipool_coding_and_spatial_visual_swarm(tmp_path: Path) -> None:

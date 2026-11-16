@@ -2,9 +2,11 @@
 # Created by scripts/setup-ollama-model.sh as `mpdc-qwen3-4b`.
 FROM qwen3:4b-instruct-2507-q4_K_M
 
-# Ollama's OpenAI-compatible API cannot set the context size per request, and
-# its default is far below SICA's ~12k-token system prompt; pin it here.
-PARAMETER num_ctx 32768
+# Context per parallel slot. With OLLAMA_NUM_PARALLEL=2 the server runs two
+# 16k slots (coder + independent tester) in the same VRAM one 32k slot would
+# use (~5.2 GB with q8_0 KV cache). Ollama's OpenAI API can't set this per
+# request, so it is pinned here.
+PARAMETER num_ctx 16384
 
 # Qwen's recommended sampling for Instruct-2507 (requests may override temperature/top_p).
 PARAMETER temperature 0.7

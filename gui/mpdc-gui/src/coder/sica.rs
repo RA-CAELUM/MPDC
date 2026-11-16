@@ -34,6 +34,8 @@ pub struct SicaRunRequest {
     pub timeout_s: u64,
     /// Plan-only run: the agent gets no file-editing tools.
     pub read_only: bool,
+    /// Extra environment for this run (e.g. SICA_ROLE=tester).
+    pub extra_env: Vec<(String, String)>,
 }
 
 /// "local" (default): one lean agent with native tool calling, sized for a
@@ -122,6 +124,15 @@ fn sica_python(root: &Path) -> String {
 }
 
 fn run_logdir() -> PathBuf {
+    cache_subdir("sica-runs")
+}
+
+/// Fresh directory for the independent tester's acceptance tests (outside the project).
+pub fn acceptance_dir() -> PathBuf {
+    cache_subdir("acceptance")
+}
+
+fn cache_subdir(kind: &str) -> PathBuf {
     let base = env::var("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|_| env::var("HOME").map(|h| PathBuf::from(h).join(".cache")))
@@ -130,7 +141,7 @@ fn run_logdir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    base.join("mpdc").join("sica-runs").join(format!("run-{ts}"))
+    base.join("mpdc").join(kind).join(format!("run-{ts}"))
 }
 
 /// Runs SICA to completion on the calling thread, reporting through `on_event`.
@@ -179,6 +190,7 @@ pub fn run_sica(req: SicaRunRequest, mut on_event: impl FnMut(SicaEvent)) {
         .env("PYTHONUNBUFFERED", "1")
         .env("SICA_AGENT_MODE", agent_mode())
         .env("SICA_READ_ONLY", if req.read_only { "1" } else { "0" })
+        .envs(req.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         // Off by default: on a single local GPU the overseer's interleaved calls
         // evict the agent's prompt cache. Re-enable with MPDC_SICA_OVERSEER=1.
         .env(

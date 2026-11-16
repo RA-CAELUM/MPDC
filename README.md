@@ -30,9 +30,9 @@ This compiles and installs four global commands onto your `$PATH` so you can run
 ## 2. How to Run MPDC
 
 ### Step A: Start Your Local Model (default: 6 GB GPU via Ollama)
-The default config (`config/default.yaml`) targets a single **6 GB GPU such as an RTX 3050 6GB** with **Qwen3-4B-Instruct-2507 (Q4_K_M)** on [Ollama](https://ollama.com), using a 32k context. SICA's system prompt alone is about 12k tokens, so 32k is the practical minimum.
+The default config (`config/default.yaml`) targets a single **6 GB GPU such as an RTX 3050 6GB** with **Qwen3-4B-Instruct-2507 (Q4_K_M)** on [Ollama](https://ollama.com), loaded once and served from **two parallel 16k-context slots**: one for the coding agent and one for an independent tester agent that works at the same time.
 
-1. Run the Ollama server with flash attention and an 8-bit KV cache (that is what makes 32k fit in 6 GB). On NixOS:
+1. Run the Ollama server with flash attention, an 8-bit KV cache and two slots (that is what makes 2 × 16k fit in 6 GB). On NixOS:
    ```nix
    services.ollama = {
      enable = true;
@@ -40,18 +40,18 @@ The default config (`config/default.yaml`) targets a single **6 GB GPU such as a
      environmentVariables = {
        OLLAMA_FLASH_ATTENTION = "1";
        OLLAMA_KV_CACHE_TYPE = "q8_0";
-       OLLAMA_NUM_PARALLEL = "1";      # each parallel slot would need its own 32k KV cache
+       OLLAMA_NUM_PARALLEL = "2";      # two agents at once; each slot gets num_ctx (16k) of KV cache
        OLLAMA_MAX_LOADED_MODELS = "1";
      };
    };
    ```
-   Or ad hoc: `OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 OLLAMA_NUM_PARALLEL=1 ollama serve`
-2. Create the model once (pulls ~2.5 GB, then wraps it as `mpdc-qwen3-4b` with `num_ctx 32768` from [config/ollama/Modelfile](config/ollama/Modelfile)):
+   Or ad hoc: `OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 OLLAMA_NUM_PARALLEL=2 ollama serve`
+2. Create the model once (pulls ~2.5 GB, then wraps it as `mpdc-qwen3-4b` with `num_ctx 16384` per slot from [config/ollama/Modelfile](config/ollama/Modelfile)):
    ```bash
    ./scripts/setup-ollama-model.sh
    ```
    Why this model: on a two-task benchmark (new FizzBuzz module; fix bugs in an existing module and add a function, checked by hidden tests the agent never sees, 3 runs each) Qwen3-4B-Instruct-2507 passed **5/6**, typically in 20–120 s. Qwen2.5-Coder-7B (Q4, 16k context, also fits in ~5 GB) passed 2/6: it often narrates instead of calling tools.
-3. Check: `ollama ps` should show `mpdc-qwen3-4b ... 100% GPU ... 32768`. Measured footprint with a full ~25k-token prompt: **~5.2 GB VRAM**. If the card also drives your display and it doesn't fit, Ollama offloads a few layers to CPU (slower, still works).
+3. Check: `ollama ps` should show `mpdc-qwen3-4b ... 100% GPU ... 16384`. Measured footprint with both slots active: **~5.2 GB VRAM**, each slot generating ~100 tok/s on short contexts (RTX 5070 Laptop; expect roughly half on a 3050). If the card also drives your display and it doesn't fit, Ollama offloads a few layers to CPU (slower, still works).
 
 **Bigger GPUs (vLLM):** point `inference.backend_url` / `base_model` in `config/default.yaml` at your server, e.g.
 ```bash
@@ -80,7 +80,8 @@ Every prompt is executed by the **[MPDC-SICA](modules/MPDC-SICA)** agent, which 
 - **Native tool calling** (the model's own function-call format, not SICA's XML protocol) with six tools: `list_files`, `read_file`, `write_file`, `replace_in_file`, `run_command`, `finish`. System prompt + tool schemas are ~1.5k tokens (SICA's full orchestrator uses ~12k).
 - **Context fitting:** older tool output is shortened and, if needed, the oldest steps are dropped so requests always fit the served context window.
 - **Loop guard:** repeating the exact same tool call is warned on the 3rd time and stops the round on the 5th.
-- **Verify-and-fix rounds:** after each round `mpdc-code` runs an independent check (`cargo test`, `pytest`, `ctest` or `nix flake check`); on failure the output is sent back to the agent for another round (up to `MPDC_VERIFY_ROUNDS`). Verified results are harvested as training data, including the (failed → fixed) pair.
+- **Independent tester (second slot):** for Python projects, a second agent writes acceptance tests from the task description *only* (it never sees the new code, and its tests live outside your project) while the coder works. Its tests catch requirements the coder's own tests miss; `MPDC_TESTER=0` turns it off.
+- **Verify-and-fix rounds:** after each round `mpdc-code` runs the project's checks (`cargo test`, `pytest`, `ctest` or `nix flake check`) plus the tester's acceptance tests, and fails the round if pre-existing tests were deleted; on failure the output is sent back to the agent for another round (up to `MPDC_VERIFY_ROUNDS`). Verified results are harvested as training data, including the (failed → fixed) pair.
 
 `mpdc-code` streams the agent's events into the chat pane, shows the **actual** file changes (before/after snapshot diff), and saves full traces under `~/.cache/mpdc/sica-runs/`. `MPDC_SICA_MODE=full` restores SICA's original multi-agent orchestrator (meant for larger models).
 
@@ -94,7 +95,8 @@ Every prompt is executed by the **[MPDC-SICA](modules/MPDC-SICA)** agent, which 
 | `MPDC_SICA_TIMEOUT` | `600` | Seconds per round before the agent is cancelled |
 | `MPDC_SICA_OVERSEER` | `0` | `1` re-enables SICA's LLM overseer (costs prompt-cache hits on one GPU) |
 | `MPDC_SICA_ROOT` / `MPDC_SICA_PYTHON` | repo submodule / `scripts/sica-python.sh` | Where SICA lives and which Python (with pytest) runs it |
-| `LOCAL_LLM_CONTEXT_TOKENS` | `32768` | Must match the model's `num_ctx`; used for context fitting |
+| `MPDC_TESTER` | `1` | `0` disables the parallel acceptance-test agent |
+| `LOCAL_LLM_CONTEXT_TOKENS` | `16384` | Must match the model's per-slot `num_ctx`; used for context fitting |
 | `LOCAL_LLM_MAX_TOKENS` | `4096` | Output-token cap per call |
 | `LOCAL_LLM_KEEP_FULL_RESULTS` | `4` | Most recent tool results kept unshortened |
 | `SICA_MAX_ITERATIONS` | `40` | Max agent steps per round |
