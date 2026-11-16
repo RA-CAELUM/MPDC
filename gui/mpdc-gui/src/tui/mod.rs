@@ -298,9 +298,19 @@ pub fn render_once_snapshot(width: u16, height: u16) -> io::Result<()> {
             if cell.modifier.contains(Modifier::BOLD) {
                 write!(out, "\x1b[1m")?;
             }
-            write!(out, "{}\x1b[0m", cell.symbol())?;
+            if let Err(e) = write!(out, "{}\x1b[0m", cell.symbol()) {
+                if e.kind() == io::ErrorKind::BrokenPipe {
+                    return Ok(());
+                }
+                return Err(e);
+            }
         }
-        writeln!(out)?;
+        if let Err(e) = writeln!(out) {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(e);
+        }
     }
     Ok(())
 }

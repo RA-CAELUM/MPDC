@@ -46,6 +46,10 @@ in
   };
 
   config = mkIf cfg.enable {
+    environment.systemPackages = [
+      pkgs.python312
+    ];
+
     systemd.tmpfiles.rules = [
       "d ${cfg.dataDir} 0750 root root -"
       "d ${cfg.dataDir}/datasets 0750 root root -"

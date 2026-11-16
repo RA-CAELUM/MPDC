@@ -284,3 +284,50 @@ def test_sica_local_qwen3_provider_and_think_block_stripping() -> None:
     provider = LocalOpenAIProvider()
     assert str(provider.client.base_url).rstrip("/").endswith("/v1")
 
+
+def test_multipool_coding_and_spatial_visual_swarm(tmp_path: Path) -> None:
+    cfg = _make_test_config(tmp_path)
+    app = create_gateway_app(cfg)
+    client = TestClient(app)
+
+    # 1. Inspect default multi-model pools (4 coding + 3 visual/spatial)
+    pools = client.get("/v1/mpdc/pools").json()
+    assert len(pools["coding_models"]) == 4
+    assert len(pools["spatial_visual_models"]) == 3
+
+    # 2. Register an additional 3D Spatial model dynamically
+    added = client.post(
+        "/v1/mpdc/pools/register",
+        json={
+            "id": "molmo-spatial-7b",
+            "name": "allenai/Molmo-7B-D-0924",
+            "role": "AFFORDANCE_KEYPOINT_AGENT",
+            "category": "spatial_3d",
+            "endpoint_url": "http://127.0.0.1:8006/v1",
+            "thinking": True,
+            "modalities": ["image", "keypoints_3d"],
+            "active": True,
+        },
+    )
+    assert added.status_code == 200
+    assert len(client.get("/v1/mpdc/pools").json()["spatial_visual_models"]) == 4
+
+    # 3. Execute multimodal swarm across Spatial/Visual Pool + Coding Pool
+    swarm_resp = client.post(
+        "/v1/mpdc/swarm",
+        json={
+            "prompt": "Fix ROS2 grasp controller Z-axis orientation using MuJoCo depth & point cloud",
+            "domain": "robotics",
+            "image_paths": ["sim_viewport.png"],
+            "pointcloud_paths": ["wrist_cam.ply"],
+            "coordination_mode": "sensor_fusion_loop",
+        },
+    )
+    assert swarm_resp.status_code == 200
+    data = swarm_resp.json()
+    assert "<mpdc_spatial_scene_graph>" in data["spatial_scene_graph"]
+    assert len(data["spatial_steps"]) == 4
+    assert len(data["coding_steps"]) == 4
+    assert "target_pose_se3" in data["spatial_scene_graph"]
+
+

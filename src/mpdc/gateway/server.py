@@ -13,8 +13,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from mpdc.agents.orchestrator import MultiAgentOrchestrator, format_skill_block
-from mpdc.config import MPDCConfig
+from mpdc.agents.orchestrator import (
+    MultiAgentOrchestrator,
+    SpatialObservation,
+    format_skill_block,
+)
+from mpdc.config import MPDCConfig, ModelWorkerConfig
 from mpdc.evaluation.quantifier import SelfImprovementQuantifier
 from mpdc.harvester.collector import TrajectoryHarvester
 from mpdc.mcp_server.server import MPDCMCPServer
@@ -53,6 +57,40 @@ class RegisterNodeRequest(BaseModel):
     hostname: Optional[str] = None
     ip_address: str = "192.168.1.50"
     datacenter_host: str = "mpdc.local"
+
+
+class SwarmExecuteRequest(BaseModel):
+    prompt: str
+    domain: str = "robotics"
+    image_paths: list[str] = Field(default_factory=list)
+    pointcloud_paths: list[str] = Field(default_factory=list)
+    sim_state_json: str = ""
+    camera_frame: str = "world"
+    coding_models: Optional[list[str]] = None
+    spatial_models: Optional[list[str]] = None
+    coordination_mode: Optional[str] = None
+    client_node: str = "mpdc-cli"
+
+
+def build_mpdc_native_client_profile(
+    datacenter_host: str, port: int, node_id: str, pools: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
+    """Generates a native `mpdc code` + FOSS multi-agent client profile (zero OpenCode dependency)."""
+    base_http = f"http://{datacenter_host}:{port}"
+    return {
+        "client": "mpdc-native-cli",
+        "node_id": node_id,
+        "gateway_url": base_http,
+        "openai_base_url": f"{base_http}/v1",
+        "swarm_endpoint": f"{base_http}/v1/mpdc/swarm",
+        "mcp_endpoint": f"{base_http}/mcp",
+        "headers": {"X-MPDC-Client-Node": node_id},
+        "cli_example": (
+            f"MPDC_GATEWAY_URL={base_http} mpdc code 'Fix grasp pose controller' "
+            "--image viewport.png --pointcloud scene.ply --mode sensor_fusion_loop"
+        ),
+        "model_pools": pools or {},
+    }
 
 
 def build_client_opencode_config(datacenter_host: str, port: int, node_id: str) -> dict[str, Any]:
@@ -374,7 +412,67 @@ def create_gateway_app(config: Optional[MPDCConfig] = None) -> FastAPI:
         opencode_cfg = build_client_opencode_config(
             req.datacenter_host, cfg.server.port, req.node_id
         )
-        return {"node": node, "opencode_config": opencode_cfg}
+        native_profile = build_mpdc_native_client_profile(
+            req.datacenter_host,
+            cfg.server.port,
+            req.node_id,
+            orchestrator.list_model_pools(),
+        )
+        return {
+            "node": node,
+            "mpdc_client_profile": native_profile,
+            "opencode_config": opencode_cfg,
+        }
+
+    @app.get("/v1/mpdc/pools")
+    async def get_pools() -> dict[str, Any]:
+        return orchestrator.list_model_pools()
+
+    @app.post("/v1/mpdc/pools/register")
+    async def register_pool_worker(worker: ModelWorkerConfig) -> dict[str, Any]:
+        return orchestrator.register_pool_model(worker)
+
+    @app.post("/v1/mpdc/pools/{model_id}/toggle")
+    async def toggle_pool_worker(model_id: str) -> dict[str, Any]:
+        updated = orchestrator.toggle_pool_model(model_id)
+        if not updated:
+            raise HTTPException(status_code=404, detail=f"Pool model '{model_id}' not found")
+        return updated
+
+    @app.post("/v1/mpdc/swarm")
+    async def run_multimodal_swarm(req: SwarmExecuteRequest, request: Request) -> dict[str, Any]:
+        client_ip = request.client.host if request.client else "127.0.0.1"
+        node_id = request.headers.get("X-MPDC-Client-Node") or req.client_node
+        res = await orchestrator.execute_multimodal_swarm(
+            prompt=req.prompt,
+            domain=req.domain,
+            observation=SpatialObservation(
+                image_paths=req.image_paths,
+                pointcloud_paths=req.pointcloud_paths,
+                sim_state_json=req.sim_state_json,
+                camera_frame=req.camera_frame,
+            ),
+            coding_model_ids=req.coding_models,
+            spatial_model_ids=req.spatial_models,
+            coordination_mode=req.coordination_mode,
+        )
+        store.upsert_client_node(
+            node_id=node_id,
+            hostname=node_id,
+            ip_address=client_ip,
+            prompt_tokens_delta=256,
+            completion_tokens_delta=192,
+            tok_per_sec=72.4,
+            active_model=f"swarm:{res.coordination_mode}",
+        )
+        return {
+            "coordination_mode": res.coordination_mode,
+            "spatial_scene_graph": res.spatial_scene_graph,
+            "spatial_steps": [s.__dict__ for s in res.spatial_steps],
+            "coding_steps": [s.__dict__ for s in res.coding_steps],
+            "synthesized_patch": res.synthesized_patch,
+            "skills_injected": res.skills_injected,
+        }
 
     @app.post("/v1/mpdc/nodes/{node_id}/toggle")
     async def toggle_node(node_id: str) -> dict[str, Any]:
@@ -427,6 +525,7 @@ def create_gateway_app(config: Optional[MPDCConfig] = None) -> FastAPI:
             "nodes": nodes,
             "skills": skills,
             "adapters": adapters,
+            "model_pools": orchestrator.list_model_pools(),
         }
 
     return app

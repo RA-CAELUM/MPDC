@@ -35,6 +35,103 @@ class AgentsConfig(BaseModel):
     min_skill_similarity: float = 0.25
 
 
+class ModelWorkerConfig(BaseModel):
+    id: str
+    name: str
+    role: str
+    category: str  # "coding", "reasoning", "vision", "spatial_3d", "geometry"
+    endpoint_url: str = "http://127.0.0.1:8001/v1"
+    thinking: bool = False
+    modalities: list[str] = Field(default_factory=lambda: ["text"])
+    active: bool = True
+
+
+def _default_coding_pool() -> list[ModelWorkerConfig]:
+    return [
+        ModelWorkerConfig(
+            id="qwen3-architect",
+            name="Qwen/Qwen3-30B-A3B",
+            role="ARCHITECT_PLANNER",
+            category="reasoning",
+            endpoint_url="http://127.0.0.1:8001/v1",
+            thinking=True,
+            modalities=["text", "scene_graph"],
+            active=True,
+        ),
+        ModelWorkerConfig(
+            id="qwen3-coder",
+            name="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            role="SYSTEMS_CODER",
+            category="coding",
+            endpoint_url="http://127.0.0.1:8001/v1",
+            thinking=False,
+            modalities=["text", "ast_diff", "scene_graph"],
+            active=True,
+        ),
+        ModelWorkerConfig(
+            id="deepseek-r1-verifier",
+            name="deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+            role="FORMAL_VERIFIER",
+            category="reasoning",
+            endpoint_url="http://127.0.0.1:8002/v1",
+            thinking=True,
+            modalities=["text", "compiler_trace"],
+            active=True,
+        ),
+        ModelWorkerConfig(
+            id="qwen3-fast-patch",
+            name="Qwen/Qwen3-8B",
+            role="FAST_PATCH_APPLIER",
+            category="coding",
+            endpoint_url="http://127.0.0.1:8001/v1",
+            thinking=False,
+            modalities=["text"],
+            active=True,
+        ),
+    ]
+
+
+def _default_spatial_visual_pool() -> list[ModelWorkerConfig]:
+    return [
+        ModelWorkerConfig(
+            id="qwen25-vl-32b",
+            name="Qwen/Qwen2.5-VL-32B-Instruct",
+            role="VLM_2D_VIDEO_CRITIC",
+            category="vision",
+            endpoint_url="http://127.0.0.1:8003/v1",
+            thinking=False,
+            modalities=["image", "video", "sim_viewport"],
+            active=True,
+        ),
+        ModelWorkerConfig(
+            id="spatial-vlm-3d",
+            name="SpatialVLM/Spatial-Grounded-13B",
+            role="SPATIAL_3D_GROUNDER",
+            category="spatial_3d",
+            endpoint_url="http://127.0.0.1:8004/v1",
+            thinking=True,
+            modalities=["image", "rgbd", "bbox_3d", "se3_pose", "affordance"],
+            active=True,
+        ),
+        ModelWorkerConfig(
+            id="mast3r-depth-geo",
+            name="Naver/MASt3R-DepthAnything-V2",
+            role="GEOMETRY_POINTCLOUD_ENCODER",
+            category="geometry",
+            endpoint_url="http://127.0.0.1:8005/v1",
+            thinking=False,
+            modalities=["pointcloud", "depth_map", "urdf_mjcf", "mesh"],
+            active=True,
+        ),
+    ]
+
+
+class ModelPoolsConfig(BaseModel):
+    coordination_mode: str = "sensor_fusion_loop"  # "specialist_graph", "parallel_ensemble", "sensor_fusion_loop"
+    coding_models: list[ModelWorkerConfig] = Field(default_factory=_default_coding_pool)
+    spatial_visual_models: list[ModelWorkerConfig] = Field(default_factory=_default_spatial_visual_pool)
+
+
 class HarvesterConfig(BaseModel):
     train_split_ratio: float = 0.80
     min_patch_lines: int = 2
@@ -61,6 +158,7 @@ class MPDCConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    pools: ModelPoolsConfig = Field(default_factory=ModelPoolsConfig)
     harvester: HarvesterConfig = Field(default_factory=HarvesterConfig)
     trainer: TrainerConfig = Field(default_factory=TrainerConfig)
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
