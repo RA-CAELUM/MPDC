@@ -109,6 +109,108 @@ pub struct AdapterItem {
     pub promoted: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolWorkerItem {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub category: String,
+    pub endpoint_url: String,
+    pub thinking: bool,
+    #[serde(default)]
+    pub modalities: Vec<String>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPoolsPayload {
+    pub coordination_mode: String,
+    pub coding_models: Vec<PoolWorkerItem>,
+    pub spatial_visual_models: Vec<PoolWorkerItem>,
+}
+
+impl Default for ModelPoolsPayload {
+    fn default() -> Self {
+        Self {
+            coordination_mode: "sensor_fusion_loop".into(),
+            coding_models: vec![
+                PoolWorkerItem {
+                    id: "qwen3-architect".into(),
+                    name: "Qwen/Qwen3-30B-A3B".into(),
+                    role: "ARCHITECT_PLANNER".into(),
+                    category: "reasoning".into(),
+                    endpoint_url: "http://127.0.0.1:8001/v1".into(),
+                    thinking: true,
+                    modalities: vec!["text".into(), "scene_graph".into()],
+                    active: true,
+                },
+                PoolWorkerItem {
+                    id: "qwen3-coder".into(),
+                    name: "Qwen/Qwen3-Coder-30B-A3B-Instruct".into(),
+                    role: "SYSTEMS_CODER".into(),
+                    category: "coding".into(),
+                    endpoint_url: "http://127.0.0.1:8001/v1".into(),
+                    thinking: false,
+                    modalities: vec!["text".into(), "ast_diff".into(), "scene_graph".into()],
+                    active: true,
+                },
+                PoolWorkerItem {
+                    id: "deepseek-r1-verifier".into(),
+                    name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B".into(),
+                    role: "FORMAL_VERIFIER".into(),
+                    category: "reasoning".into(),
+                    endpoint_url: "http://127.0.0.1:8002/v1".into(),
+                    thinking: true,
+                    modalities: vec!["text".into(), "compiler_trace".into()],
+                    active: true,
+                },
+                PoolWorkerItem {
+                    id: "qwen3-fast-patch".into(),
+                    name: "Qwen/Qwen3-8B".into(),
+                    role: "FAST_PATCH_APPLIER".into(),
+                    category: "coding".into(),
+                    endpoint_url: "http://127.0.0.1:8001/v1".into(),
+                    thinking: false,
+                    modalities: vec!["text".into()],
+                    active: true,
+                },
+            ],
+            spatial_visual_models: vec![
+                PoolWorkerItem {
+                    id: "qwen25-vl-32b".into(),
+                    name: "Qwen/Qwen2.5-VL-32B-Instruct".into(),
+                    role: "VLM_2D_VIDEO_CRITIC".into(),
+                    category: "vision".into(),
+                    endpoint_url: "http://127.0.0.1:8003/v1".into(),
+                    thinking: false,
+                    modalities: vec!["image".into(), "video".into(), "sim_viewport".into()],
+                    active: true,
+                },
+                PoolWorkerItem {
+                    id: "spatial-vlm-3d".into(),
+                    name: "SpatialVLM/Spatial-Grounded-13B".into(),
+                    role: "SPATIAL_3D_GROUNDER".into(),
+                    category: "spatial_3d".into(),
+                    endpoint_url: "http://127.0.0.1:8004/v1".into(),
+                    thinking: true,
+                    modalities: vec!["rgbd".into(), "bbox_3d".into(), "se3_pose".into()],
+                    active: true,
+                },
+                PoolWorkerItem {
+                    id: "mast3r-depth-geo".into(),
+                    name: "Naver/MASt3R-DepthAnything-V2".into(),
+                    role: "GEOMETRY_POINTCLOUD_ENCODER".into(),
+                    category: "geometry".into(),
+                    endpoint_url: "http://127.0.0.1:8005/v1".into(),
+                    thinking: false,
+                    modalities: vec!["pointcloud".into(), "depth_map".into(), "urdf_mjcf".into()],
+                    active: true,
+                },
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OverviewPayload {
     pub server: ServerInfo,
@@ -118,6 +220,8 @@ pub struct OverviewPayload {
     pub nodes: Vec<ClientNode>,
     pub skills: Vec<SkillItem>,
     pub adapters: Vec<AdapterItem>,
+    #[serde(default)]
+    pub model_pools: ModelPoolsPayload,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +360,7 @@ impl OverviewPayload {
                     promoted: 1,
                 },
             ],
+            model_pools: ModelPoolsPayload::default(),
         }
     }
 }

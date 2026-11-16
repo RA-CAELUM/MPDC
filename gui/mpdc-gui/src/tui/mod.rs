@@ -159,11 +159,25 @@ impl BtopTuiApp {
                     ));
                 }
             }
+            KeyCode::Char('m') => {
+                let next_mode = match self.overview.model_pools.coordination_mode.as_str() {
+                    "sensor_fusion_loop" => "parallel_ensemble",
+                    "parallel_ensemble" => "specialist_graph",
+                    _ => "sensor_fusion_loop",
+                };
+                self.overview.model_pools.coordination_mode = next_mode.into();
+                self.events.push(format!(
+                    "[SWARM] Coordination mode -> {} ({} coding + {} spatial/vis models)",
+                    next_mode,
+                    self.overview.model_pools.coding_models.len(),
+                    self.overview.model_pools.spatial_visual_models.len()
+                ));
+            }
             KeyCode::Char('o') => {
                 if let Some(node) = self.overview.nodes.get(self.selected_node) {
                     self.events.push(format!(
-                        "[CONFIG] opencode.json for '{}': baseURL=http://mpdc.local:{}/v1, X-MPDC-Client-Node={}",
-                        node.node_id, self.overview.server.port, node.node_id
+                        "[CLIENT] mpdc code profile for '{}': swarm=http://mpdc.local:{}/v1/mpdc/swarm",
+                        node.node_id, self.overview.server.port
                     ));
                 }
             }
@@ -249,10 +263,11 @@ impl BtopTuiApp {
             Span::raw(" "),
         ];
         footer_spans.extend(btop_key_label("[", "j/k", "] Select Node  "));
-        footer_spans.extend(btop_key_label("[", "p", "] Pause/Resume Stream  "));
-        footer_spans.extend(btop_key_label("[", "o", "] Export opencode.json  "));
+        footer_spans.extend(btop_key_label("[", "p", "] Pause Stream  "));
+        footer_spans.extend(btop_key_label("[", "m", "] Swarm Mode  "));
+        footer_spans.extend(btop_key_label("[", "o", "] Export Client  "));
         footer_spans.extend(btop_key_label("[", "s", "] Toggle Skill  "));
-        footer_spans.extend(btop_key_label("[", "t", "] QLoRA Sleep-Train  "));
+        footer_spans.extend(btop_key_label("[", "t", "] QLoRA Train  "));
         footer_spans.extend(btop_key_label("[", "q", "] Quit"));
 
         f.render_widget(

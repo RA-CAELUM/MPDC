@@ -41,7 +41,7 @@ pub fn spawn_post_action(gateway_url: &str, path: &str, body: serde_json::Value,
         match res {
             Ok(r) => {
                 if let Ok(val) = r.into_json::<serde_json::Value>() {
-                    if let Some(cfg) = val.get("opencode_config") {
+                    if let Some(cfg) = val.get("mpdc_client_profile").or_else(|| val.get("opencode_config")) {
                         if let Ok(pretty) = serde_json::to_string_pretty(cfg) {
                             let _ = tx.send(BgResult::GeneratedConfig(pretty));
                         }
@@ -59,25 +59,18 @@ pub fn spawn_post_action(gateway_url: &str, path: &str, body: serde_json::Value,
 pub fn format_client_opencode_json(dc_host: &str, port: u16, node_id: &str, mcp: bool) -> String {
     format!(
         r#"{{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {{
-    "mpdc": {{
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "MPDC [{dc_host}:{port}] -> {node_id}",
-      "options": {{
-        "baseURL": "http://{dc_host}:{port}/v1",
-        "apiKey": "mpdc-local",
-        "headers": {{ "X-MPDC-Client-Node": "{node_id}" }}
-      }},
-      "models": {{
-        "qwen3-mpdc": {{ "name": "Qwen3 (/think + Skills + LoRA)", "reasoning": true, "tool_call": true }},
-        "qwen3-mpdc-fast": {{ "name": "Qwen3 (/no_think Fast Coder)", "reasoning": false, "tool_call": true }}
-      }}
-    }}
-  }},
-  "model": "mpdc/qwen3-mpdc",
-  "small_model": "mpdc/qwen3-mpdc-fast",
-  "mcp": {{ "mpdc-agents": {{ "type": "remote", "url": "http://{dc_host}:{port}/mcp", "enabled": {mcp} }} }}
+  "client": "mpdc-native-cli",
+  "node_id": "{node_id}",
+  "gateway_url": "http://{dc_host}:{port}",
+  "openai_base_url": "http://{dc_host}:{port}/v1",
+  "swarm_endpoint": "http://{dc_host}:{port}/v1/mpdc/swarm",
+  "mcp_endpoint": "http://{dc_host}:{port}/mcp",
+  "mcp_enabled": {mcp},
+  "headers": {{ "X-MPDC-Client-Node": "{node_id}" }},
+  "coordination_mode": "sensor_fusion_loop",
+  "coding_pool": ["qwen3-architect", "qwen3-coder", "deepseek-r1-verifier", "qwen3-fast-patch"],
+  "spatial_visual_pool": ["qwen25-vl-32b", "spatial-vlm-3d", "mast3r-depth-geo"],
+  "cli_invocation": "MPDC_GATEWAY_URL=http://{dc_host}:{port} mpdc code 'Fix grasp pose controller' --image viewport.png --pointcloud scene.ply"
 }}"#
     )
 }

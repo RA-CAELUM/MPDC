@@ -36,6 +36,9 @@ train = [
 
 [project.scripts]
 mpdc = "mpdc.cli:app"
+mpdc-code = "mpdc.cli:run_code_entrypoint"
+mpdc-tui = "mpdc.cli:run_top_entrypoint"
+mpdc-gui = "mpdc.cli:run_gui_entrypoint"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mpdc"]

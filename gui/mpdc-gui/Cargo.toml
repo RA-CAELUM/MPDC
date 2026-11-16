@@ -17,6 +17,10 @@ path = "src/bin/mpdc-gui.rs"
 name = "mpdc-tui"
 path = "src/bin/mpdc-tui.rs"
 
+[[bin]]
+name = "mpdc-code"
+path = "src/bin/mpdc-code.rs"
+
 [dependencies]
 crossterm = "0.28"
 eframe = "0.29"

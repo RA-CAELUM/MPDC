@@ -71,6 +71,10 @@ pub struct MpdcWorkbenchApp {
     pub skill_prune_thresh: f32,
     pub inject_ast_graph: bool,
     pub auto_distill_on_fail: bool,
+    pub new_pool_model_id: String,
+    pub new_pool_model_name: String,
+    pub new_pool_model_cat: String,
+    pub new_pool_endpoint: String,
 
     pub lora_rank: u32,
     pub lora_alpha: u32,
@@ -199,6 +203,10 @@ impl MpdcWorkbenchApp {
             skill_prune_thresh: 0.30,
             inject_ast_graph: true,
             auto_distill_on_fail: true,
+            new_pool_model_id: "molmo-spatial-7b".into(),
+            new_pool_model_name: "allenai/Molmo-7B-D-0924".into(),
+            new_pool_model_cat: "spatial_3d".into(),
+            new_pool_endpoint: "http://127.0.0.1:8006/v1".into(),
 
             lora_rank: 16,
             lora_alpha: 32,

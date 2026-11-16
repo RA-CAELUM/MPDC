@@ -140,16 +140,34 @@ impl BtopTuiApp {
             ),
         ]);
 
+        let active_code = self
+            .overview
+            .model_pools
+            .coding_models
+            .iter()
+            .filter(|m| m.active)
+            .count();
+        let active_vis = self
+            .overview
+            .model_pools
+            .spatial_visual_models
+            .iter()
+            .filter(|m| m.active)
+            .count();
         let l5 = Line::from(vec![
-            Span::styled(" SPLIT  ", Style::default().fg(BTOP_MAIN_FG)),
+            Span::styled(" POOLS ", Style::default().fg(BTOP_MAIN_FG)),
             Span::styled(
-                format!("{} SFT/DPO train (80%)", sc.train_trajectories),
-                Style::default().fg(Color::Rgb(167, 139, 250)),
+                format!("{} Code/Reason", active_code),
+                Style::default().fg(Color::Rgb(56, 189, 248)).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" | ", Style::default().fg(BTOP_GRAPH_TEXT)),
+            Span::styled(" + ", Style::default().fg(BTOP_GRAPH_TEXT)),
             Span::styled(
-                format!("{} Golden Replay (20%)", sc.golden_replay_holdout),
-                Style::default().fg(Color::Rgb(244, 114, 182)),
+                format!("{} Vis/Spatial", active_vis),
+                Style::default().fg(Color::Rgb(244, 114, 182)).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ({})", self.overview.model_pools.coordination_mode),
+                Style::default().fg(Color::Rgb(167, 139, 250)),
             ),
         ]);
 
@@ -272,7 +290,8 @@ impl BtopTuiApp {
             ),
         ];
         title_spans.extend(btop_key_label("─[", "p", "]ause "));
-        title_spans.extend(btop_key_label("[", "o", "]pencode.json─"));
+        title_spans.extend(btop_key_label("[", "m", "]ode "));
+        title_spans.extend(btop_key_label("[", "o", "]client.json─"));
 
         let total_out = self
             .overview

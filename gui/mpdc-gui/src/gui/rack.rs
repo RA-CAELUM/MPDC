@@ -8,7 +8,7 @@ use crate::{
         },
         MpdcWorkbenchApp,
     },
-    models::AdapterItem,
+    models::{AdapterItem, PoolWorkerItem},
 };
 use eframe::egui::{self, RichText};
 
@@ -141,43 +141,132 @@ impl MpdcWorkbenchApp {
     }
 
     pub fn render_left_agent_routing_rack(&mut self, ui: &mut egui::Ui) {
-        section_header(ui, "AGT.02", "MULTI-AGENT ROUTING & SKILL RAG");
+        section_header(ui, "AGT.02", "MULTI-POOL CODING + SPATIAL/VISUAL SWARM");
         egui::Frame::group(ui.style())
             .fill(BG_PANEL)
             .show(ui, |ui| {
-                egui::Grid::new("agent_matrix_grid")
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("SWARM_MODE").color(TEXT_MUTED));
+                    for mode in ["sensor_fusion_loop", "parallel_ensemble", "specialist_graph"] {
+                        let short = match mode {
+                            "sensor_fusion_loop" => "FUSION",
+                            "parallel_ensemble" => "ENSEMBLE",
+                            _ => "GRAPH",
+                        };
+                        ui.selectable_value(
+                            &mut self.overview.model_pools.coordination_mode,
+                            mode.into(),
+                            short,
+                        );
+                    }
+                });
+
+                ui.separator();
+                ui.label(
+                    RichText::new(format!(
+                        "PROGRAMMING & REASONING POOL ({} MODELS)",
+                        self.overview.model_pools.coding_models.len()
+                    ))
+                    .color(SVG_SKY)
+                    .strong(),
+                );
+                egui::Grid::new("coding_pool_grid")
                     .striped(true)
-                    .num_columns(5)
+                    .num_columns(4)
                     .spacing([4.0, 2.0])
                     .show(ui, |ui| {
-                        for h in ["ROLE", "THINK", "TEMP", "TOP_P", "MAX_T"] {
+                        for h in ["ON", "ID", "ROLE", "THINK"] {
                             ui.label(RichText::new(h).color(ACCENT_CYAN).strong());
                         }
                         ui.end_row();
-
-                        for ag in &mut self.agent_roles {
-                            ui.label(RichText::new(ag.role).color(TEXT_PRIMARY).strong());
-                            ui.checkbox(&mut ag.thinking, "");
-                            ui.add(
-                                egui::DragValue::new(&mut ag.temperature)
-                                    .range(0.0..=1.5)
-                                    .speed(0.01)
-                                    .fixed_decimals(2),
-                            );
-                            ui.add(
-                                egui::DragValue::new(&mut ag.top_p)
-                                    .range(0.1..=1.0)
-                                    .speed(0.01)
-                                    .fixed_decimals(2),
-                            );
-                            ui.add(
-                                egui::DragValue::new(&mut ag.max_tokens)
-                                    .range(256..=16384)
-                                    .speed(128.0),
-                            );
+                        for m in &mut self.overview.model_pools.coding_models {
+                            ui.checkbox(&mut m.active, "");
+                            ui.label(RichText::new(&m.id).color(TEXT_PRIMARY).strong());
+                            ui.label(RichText::new(&m.role).color(TEXT_MUTED));
+                            ui.checkbox(&mut m.thinking, "");
                             ui.end_row();
                         }
                     });
+
+                ui.separator();
+                ui.label(
+                    RichText::new(format!(
+                        "VISUAL & SPATIAL INTELLIGENCE POOL ({} MODELS)",
+                        self.overview.model_pools.spatial_visual_models.len()
+                    ))
+                    .color(SVG_PINK)
+                    .strong(),
+                );
+                egui::Grid::new("spatial_pool_grid")
+                    .striped(true)
+                    .num_columns(4)
+                    .spacing([4.0, 2.0])
+                    .show(ui, |ui| {
+                        for h in ["ON", "ID", "CAT", "MODALITIES"] {
+                            ui.label(RichText::new(h).color(SVG_VIOLET).strong());
+                        }
+                        ui.end_row();
+                        for m in &mut self.overview.model_pools.spatial_visual_models {
+                            ui.checkbox(&mut m.active, "");
+                            ui.label(RichText::new(&m.id).color(TEXT_PRIMARY).strong());
+                            ui.label(RichText::new(&m.category).color(SVG_PINK));
+                            ui.label(RichText::new(m.modalities.join(",")).color(TEXT_MUTED));
+                            ui.end_row();
+                        }
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("NEW_ID").color(TEXT_MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut self.new_pool_model_id).desired_width(88.0));
+                    egui::ComboBox::from_id_salt("pool_cat_cb")
+                        .width(78.0)
+                        .selected_text(&self.new_pool_model_cat)
+                        .show_ui(ui, |ui| {
+                            for c in ["coding", "reasoning", "vision", "spatial_3d", "geometry"] {
+                                ui.selectable_value(&mut self.new_pool_model_cat, c.into(), c);
+                            }
+                        });
+                    if ui.small_button("[+ADD MODEL]").clicked() {
+                        let is_spatial = matches!(
+                            self.new_pool_model_cat.as_str(),
+                            "vision" | "spatial_3d" | "geometry"
+                        );
+                        let item = PoolWorkerItem {
+                            id: self.new_pool_model_id.clone(),
+                            name: self.new_pool_model_name.clone(),
+                            role: if is_spatial {
+                                "SPATIAL_SPECIALIST".into()
+                            } else {
+                                "CODE_SPECIALIST".into()
+                            },
+                            category: self.new_pool_model_cat.clone(),
+                            endpoint_url: self.new_pool_endpoint.clone(),
+                            thinking: matches!(
+                                self.new_pool_model_cat.as_str(),
+                                "reasoning" | "spatial_3d"
+                            ),
+                            modalities: if is_spatial {
+                                vec!["rgbd".into(), "bbox_3d".into(), "se3_pose".into()]
+                            } else {
+                                vec!["text".into(), "scene_graph".into()]
+                            },
+                            active: true,
+                        };
+                        if is_spatial {
+                            self.overview.model_pools.spatial_visual_models.push(item);
+                        } else {
+                            self.overview.model_pools.coding_models.push(item);
+                        }
+                        self.event_feed.insert(
+                            0,
+                            format!(
+                                "[POOL] Added {} model '{}'",
+                                self.new_pool_model_cat, self.new_pool_model_id
+                            ),
+                        );
+                    }
+                });
 
                 ui.separator();
                 egui::Grid::new("skill_rag_params")
